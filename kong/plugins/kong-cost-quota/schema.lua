@@ -65,6 +65,65 @@ return {
               default = true,
             },
           },
+          {
+            redis_host = {
+              type = "string",
+              required = false,
+              default = "127.0.0.1",
+            },
+          },
+          {
+            redis_port = {
+              type = "integer",
+              required = false,
+              default = 6379,
+              between = { 1, 65535 },
+            },
+          },
+          {
+            redis_database = {
+              type = "integer",
+              required = false,
+              default = 0,
+              between = { 0, 15 },
+            },
+          },
+          {
+            redis_password = {
+              type = "string",
+              required = false,
+            },
+          },
+          {
+            redis_timeout_ms = {
+              type = "integer",
+              required = false,
+              default = 20,
+              between = { 1, 60000 },
+            },
+          },
+          {
+            redis_env = {
+              type = "string",
+              required = false,
+              default = "prod",
+            },
+          },
+          {
+            usage_grace_days = {
+              type = "integer",
+              required = false,
+              default = 7,
+              between = { 0, 3650 },
+            },
+          },
+          {
+            redis_policy_required = {
+              type = "boolean",
+              required = false,
+              default = false,
+            },
+          },
         },
       },
     },

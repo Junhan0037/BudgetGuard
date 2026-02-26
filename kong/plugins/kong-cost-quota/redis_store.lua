@@ -1,0 +1,648 @@
+-- Redis 정책/사용량 저장소 모듈.
+-- 13.4 단계에서 정책 키 조회와 month/day 카운터 누적을 담당한다.
+local M = {}
+
+local WINDOWS = { "month", "day" }
+
+local has_cjson_safe, cjson_safe = pcall(require, "cjson.safe")
+local has_cjson, cjson = pcall(require, "cjson")
+
+local function is_non_empty_string(value)
+  return type(value) == "string" and value:match("%S") ~= nil
+end
+
+local function to_positive_integer(value, fallback)
+  local parsed = tonumber(value)
+  if not parsed then
+    return fallback
+  end
+
+  parsed = math.floor(parsed)
+  if parsed < 0 then
+    return fallback
+  end
+
+  return parsed
+end
+
+local function is_leap_year(year)
+  if year % 400 == 0 then
+    return true
+  end
+  if year % 100 == 0 then
+    return false
+  end
+  return year % 4 == 0
+end
+
+local function days_in_month(year, month)
+  local lookup = {
+    [1] = 31, [2] = 28, [3] = 31, [4] = 30, [5] = 31, [6] = 30,
+    [7] = 31, [8] = 31, [9] = 30, [10] = 31, [11] = 30, [12] = 31,
+  }
+
+  if month == 2 and is_leap_year(year) then
+    return 29
+  end
+
+  return lookup[month] or 30
+end
+
+local function decode_json(raw)
+  local decoder = nil
+  if has_cjson_safe and cjson_safe and cjson_safe.decode then
+    decoder = cjson_safe.decode
+  elseif has_cjson and cjson and cjson.decode then
+    decoder = cjson.decode
+  end
+
+  if not decoder then
+    decoder = nil
+  else
+    local ok, decoded = pcall(decoder, raw)
+    if ok and type(decoded) == "table" then
+      return decoded, nil
+    end
+  end
+
+  -- 테스트/로컬 실행 환경에서 cjson이 없을 수 있어 최소 JSON 파서를 제공한다.
+  local position = 1
+  local text = tostring(raw or "")
+  local text_length = #text
+
+  local function skip_whitespace()
+    while position <= text_length do
+      local ch = text:sub(position, position)
+      if ch ~= " " and ch ~= "\n" and ch ~= "\t" and ch ~= "\r" then
+        break
+      end
+      position = position + 1
+    end
+  end
+
+  local parse_value
+
+  local function parse_string()
+    if text:sub(position, position) ~= "\"" then
+      return nil, "expected string"
+    end
+    position = position + 1
+
+    local chars = {}
+    while position <= text_length do
+      local ch = text:sub(position, position)
+      if ch == "\"" then
+        position = position + 1
+        return table.concat(chars), nil
+      end
+
+      if ch == "\\" then
+        local next_ch = text:sub(position + 1, position + 1)
+        local escape_map = {
+          ["\""] = "\"",
+          ["\\"] = "\\",
+          ["/"] = "/",
+          b = "\b",
+          f = "\f",
+          n = "\n",
+          r = "\r",
+          t = "\t",
+        }
+
+        if next_ch == "u" then
+          return nil, "unicode escape is not supported"
+        end
+
+        local escaped = escape_map[next_ch]
+        if not escaped then
+          return nil, "invalid escape sequence"
+        end
+
+        chars[#chars + 1] = escaped
+        position = position + 2
+      else
+        chars[#chars + 1] = ch
+        position = position + 1
+      end
+    end
+
+    return nil, "unterminated string"
+  end
+
+  local function parse_number()
+    local start_pos = position
+    local num_pattern = "^-?%d+%.?%d*[eE]?[+-]?%d*"
+    local matched = text:sub(position):match(num_pattern)
+    if not matched or matched == "" then
+      return nil, "invalid number"
+    end
+
+    position = position + #matched
+    local parsed = tonumber(matched)
+    if not parsed then
+      return nil, "invalid number"
+    end
+
+    return parsed, nil
+  end
+
+  local function parse_literal(literal, value)
+    if text:sub(position, position + #literal - 1) == literal then
+      position = position + #literal
+      return value, nil
+    end
+    return nil, "invalid literal"
+  end
+
+  local function parse_array()
+    if text:sub(position, position) ~= "[" then
+      return nil, "expected array"
+    end
+
+    position = position + 1
+    skip_whitespace()
+
+    local result = {}
+    if text:sub(position, position) == "]" then
+      position = position + 1
+      return result, nil
+    end
+
+    while position <= text_length do
+      local value, value_err = parse_value()
+      if value_err then
+        return nil, value_err
+      end
+      result[#result + 1] = value
+
+      skip_whitespace()
+      local ch = text:sub(position, position)
+      if ch == "]" then
+        position = position + 1
+        return result, nil
+      end
+
+      if ch ~= "," then
+        return nil, "expected comma in array"
+      end
+
+      position = position + 1
+      skip_whitespace()
+    end
+
+    return nil, "unterminated array"
+  end
+
+  local function parse_object()
+    if text:sub(position, position) ~= "{" then
+      return nil, "expected object"
+    end
+
+    position = position + 1
+    skip_whitespace()
+
+    local result = {}
+    if text:sub(position, position) == "}" then
+      position = position + 1
+      return result, nil
+    end
+
+    while position <= text_length do
+      local key, key_err = parse_string()
+      if key_err then
+        return nil, key_err
+      end
+
+      skip_whitespace()
+      if text:sub(position, position) ~= ":" then
+        return nil, "expected colon in object"
+      end
+      position = position + 1
+      skip_whitespace()
+
+      local value, value_err = parse_value()
+      if value_err then
+        return nil, value_err
+      end
+      result[key] = value
+
+      skip_whitespace()
+      local ch = text:sub(position, position)
+      if ch == "}" then
+        position = position + 1
+        return result, nil
+      end
+
+      if ch ~= "," then
+        return nil, "expected comma in object"
+      end
+
+      position = position + 1
+      skip_whitespace()
+    end
+
+    return nil, "unterminated object"
+  end
+
+  function parse_value()
+    skip_whitespace()
+    local ch = text:sub(position, position)
+    if ch == "" then
+      return nil, "unexpected end of json"
+    end
+    if ch == "{" then
+      return parse_object()
+    end
+    if ch == "[" then
+      return parse_array()
+    end
+    if ch == "\"" then
+      return parse_string()
+    end
+    if ch == "t" then
+      return parse_literal("true", true)
+    end
+    if ch == "f" then
+      return parse_literal("false", false)
+    end
+    if ch == "n" then
+      return parse_literal("null", nil)
+    end
+    return parse_number()
+  end
+
+  local decoded, decode_err = parse_value()
+  if decode_err then
+    return nil, decode_err
+  end
+
+  skip_whitespace()
+  if position <= text_length then
+    return nil, "unexpected trailing json payload"
+  end
+
+  if type(decoded) ~= "table" then
+    return nil, "json root must be an object"
+  end
+
+  return decoded, nil
+end
+
+local function is_redis_null(value)
+  if value == nil then
+    return true
+  end
+
+  if ngx and ngx.null and value == ngx.null then
+    return true
+  end
+
+  return false
+end
+
+local function get_env(conf)
+  if conf and is_non_empty_string(conf.redis_env) then
+    return conf.redis_env
+  end
+  return "prod"
+end
+
+local function get_grace_days(conf)
+  if conf then
+    return to_positive_integer(conf.usage_grace_days, 7)
+  end
+  return 7
+end
+
+local function get_now_epoch(conf)
+  if conf and type(conf.redis_now_epoch) == "number" then
+    return math.floor(conf.redis_now_epoch)
+  end
+
+  if ngx and type(ngx.time) == "function" then
+    return ngx.time()
+  end
+
+  return os.time()
+end
+
+local function ensure_number(value, default_value)
+  local parsed = tonumber(value)
+  if not parsed then
+    return default_value
+  end
+  return parsed
+end
+
+function M.resolve_scope_and_id(identity)
+  if type(identity) ~= "table" then
+    return nil, nil, "identity must be an object"
+  end
+
+  if is_non_empty_string(identity.client_id) then
+    return "client", identity.client_id, nil
+  end
+
+  if is_non_empty_string(identity.org_id) then
+    return "org", identity.org_id, nil
+  end
+
+  return nil, nil, "client_id or org_id is required"
+end
+
+function M.current_epoch(conf)
+  return get_now_epoch(conf)
+end
+
+function M.build_policy_key(env, scope, id)
+  return string.format("policy:%s:%s:%s", env, scope, id)
+end
+
+function M.build_usage_key(env, window, scope, id, bucket)
+  return string.format("usage:%s:%s:%s:%s:%s", env, window, scope, id, bucket)
+end
+
+function M.compute_bucket(window, now_epoch)
+  local utc = os.date("!*t", now_epoch)
+  if window == "month" then
+    return string.format("%04d-%02d", utc.year, utc.month), nil
+  end
+
+  if window == "day" then
+    return string.format("%04d-%02d-%02d", utc.year, utc.month, utc.day), nil
+  end
+
+  return nil, "unsupported window: " .. tostring(window)
+end
+
+function M.compute_ttl_seconds(window, now_epoch, grace_days)
+  local utc = os.date("!*t", now_epoch)
+  local seconds_of_day = (utc.hour * 3600) + (utc.min * 60) + utc.sec
+  local until_end = nil
+
+  if window == "day" then
+    until_end = 86400 - seconds_of_day
+  elseif window == "month" then
+    local month_days = days_in_month(utc.year, utc.month)
+    local remaining_days = month_days - utc.day
+    until_end = (remaining_days * 86400) + (86400 - seconds_of_day)
+  else
+    return nil, "unsupported window: " .. tostring(window)
+  end
+
+  local ttl = until_end + (to_positive_integer(grace_days, 7) * 86400)
+  if ttl < 1 then
+    ttl = 1
+  end
+
+  return ttl, nil
+end
+
+function M.open_client(conf)
+  if conf and type(conf.redis_client_factory) == "function" then
+    local client, err = conf.redis_client_factory(conf)
+    if not client then
+      return nil, "failed to build redis client: " .. tostring(err), true
+    end
+    return client, nil, true
+  end
+
+  if not (conf and is_non_empty_string(conf.redis_host)) then
+    return nil, "redis host is not configured", false
+  end
+
+  local ok, redis_mod = pcall(require, "resty.redis")
+  if not ok then
+    return nil, "resty.redis is unavailable: " .. tostring(redis_mod), false
+  end
+
+  local client = redis_mod:new()
+  if not client then
+    return nil, "failed to create redis client", false
+  end
+
+  local timeout = ensure_number(conf.redis_timeout_ms, 20)
+  if type(client.set_timeout) == "function" then
+    client:set_timeout(timeout)
+  end
+
+  local connected, connect_err = client:connect(conf.redis_host, ensure_number(conf.redis_port, 6379))
+  if not connected then
+    return nil, "failed to connect redis: " .. tostring(connect_err), false
+  end
+
+  if is_non_empty_string(conf.redis_password) then
+    local auth_ok, auth_err = client:auth(conf.redis_password)
+    if not auth_ok then
+      return nil, "failed to auth redis: " .. tostring(auth_err), false
+    end
+  end
+
+  local db_index = ensure_number(conf.redis_database, 0)
+  if db_index > 0 then
+    local selected, select_err = client:select(db_index)
+    if not selected then
+      return nil, "failed to select redis db: " .. tostring(select_err), false
+    end
+  end
+
+  return client, nil, false
+end
+
+function M.close_client(client, is_factory_client)
+  if not client then
+    return
+  end
+
+  if is_factory_client then
+    if type(client.close) == "function" then
+      pcall(client.close, client)
+    end
+    return
+  end
+
+  if type(client.set_keepalive) == "function" then
+    pcall(client.set_keepalive, client, 60000, 100)
+    return
+  end
+
+  if type(client.close) == "function" then
+    pcall(client.close, client)
+  end
+end
+
+function M.fetch_policy(client, conf, identity)
+  if not client then
+    return nil, nil, "redis client is required"
+  end
+
+  local scope, id, scope_err = M.resolve_scope_and_id(identity)
+  if scope_err then
+    return nil, nil, scope_err
+  end
+
+  local env = get_env(conf)
+  local candidates = {
+    {
+      scope = scope,
+      id = id,
+      key = M.build_policy_key(env, scope, id),
+    },
+  }
+
+  -- client 정책이 없으면 org 정책으로 폴백한다.
+  if scope == "client" and is_non_empty_string(identity.org_id) then
+    candidates[#candidates + 1] = {
+      scope = "org",
+      id = identity.org_id,
+      key = M.build_policy_key(env, "org", identity.org_id),
+    }
+  end
+
+  for _, candidate in ipairs(candidates) do
+    local raw_value, get_err = client:get(candidate.key)
+    if get_err then
+      return nil, nil, "failed to fetch policy: " .. tostring(get_err)
+    end
+
+    if not is_redis_null(raw_value) then
+      local decoded, decode_err = decode_json(raw_value)
+      if decode_err then
+        return nil, nil, "failed to decode policy json: " .. tostring(decode_err)
+      end
+
+      return decoded, {
+        policy_key = candidate.key,
+        policy_source = "redis",
+        policy_scope = candidate.scope,
+        policy_id = candidate.id,
+      }, nil
+    end
+  end
+
+  return nil, {
+    policy_source = "redis",
+    policy_scope = scope,
+    policy_id = id,
+  }, nil
+end
+
+function M.read_usages(client, conf, scope, id, now_epoch)
+  if not client then
+    return nil, nil, "redis client is required"
+  end
+
+  local env = get_env(conf)
+  local base_epoch = now_epoch or get_now_epoch(conf)
+  local grace_days = get_grace_days(conf)
+
+  local usages = {}
+  local meta = {
+    keys = {},
+    buckets = {},
+    ttl_seconds = {},
+  }
+
+  for _, window in ipairs(WINDOWS) do
+    local bucket, bucket_err = M.compute_bucket(window, base_epoch)
+    if bucket_err then
+      return nil, nil, bucket_err
+    end
+
+    local ttl_seconds, ttl_err = M.compute_ttl_seconds(window, base_epoch, grace_days)
+    if ttl_err then
+      return nil, nil, ttl_err
+    end
+
+    local key = M.build_usage_key(env, window, scope, id, bucket)
+    local raw_usage, get_err = client:get(key)
+    if get_err then
+      return nil, nil, "failed to read usage: " .. tostring(get_err)
+    end
+
+    local usage_value = 0
+    if not is_redis_null(raw_usage) then
+      usage_value = tonumber(raw_usage)
+      if not usage_value then
+        return nil, nil, "usage value must be numeric for key: " .. key
+      end
+    end
+
+    usages[window] = usage_value
+    meta.keys[window] = key
+    meta.buckets[window] = bucket
+    meta.ttl_seconds[window] = ttl_seconds
+  end
+
+  return usages, meta, nil
+end
+
+function M.increment_usages(client, conf, scope, id, units, now_epoch)
+  if not client then
+    return nil, nil, "redis client is required"
+  end
+
+  local charge_units = tonumber(units)
+  if not charge_units or charge_units < 0 then
+    return nil, nil, "units must be >= 0"
+  end
+
+  local base_epoch = now_epoch
+  if type(base_epoch) ~= "number" then
+    base_epoch = get_now_epoch(conf)
+  end
+
+  local usages, meta, read_err = M.read_usages(client, conf, scope, id, base_epoch)
+  if read_err then
+    return nil, nil, read_err
+  end
+
+  local updated = {}
+  for _, window in ipairs(WINDOWS) do
+    local key = meta.keys[window]
+    local ttl_seconds = meta.ttl_seconds[window]
+
+    local after_incr, incr_err = client:incrby(key, charge_units)
+    if incr_err then
+      return nil, nil, "failed to increase usage: " .. tostring(incr_err)
+    end
+
+    local normalized_usage = tonumber(after_incr)
+    if not normalized_usage then
+      return nil, nil, "incrby result must be numeric for key: " .. key
+    end
+
+    local current_ttl, ttl_err = client:ttl(key)
+    if ttl_err then
+      return nil, nil, "failed to read ttl: " .. tostring(ttl_err)
+    end
+
+    local ttl_value = tonumber(current_ttl)
+    if not ttl_value then
+      return nil, nil, "ttl result must be numeric for key: " .. key
+    end
+
+    if ttl_value < 0 then
+      local expire_ok, expire_err = client:expire(key, ttl_seconds)
+      if expire_err then
+        return nil, nil, "failed to set ttl: " .. tostring(expire_err)
+      end
+
+      local expire_result = tonumber(expire_ok) or 0
+      if expire_result < 1 then
+        return nil, nil, "expire command failed for key: " .. key
+      end
+    end
+
+    updated[window] = normalized_usage
+  end
+
+  return updated, {
+    keys = meta.keys,
+    buckets = meta.buckets,
+    ttl_seconds = meta.ttl_seconds,
+    before = usages,
+  }, nil
+end
+
+return M

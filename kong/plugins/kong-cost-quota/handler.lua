@@ -2,6 +2,7 @@ local policy_model = require("kong.plugins.kong-cost-quota.policy_model")
 local route_matcher = require("kong.plugins.kong-cost-quota.route_matcher")
 local unit_calculator = require("kong.plugins.kong-cost-quota.unit_calculator")
 local decision = require("kong.plugins.kong-cost-quota.decision")
+local redis_store = require("kong.plugins.kong-cost-quota.redis_store")
 
 -- JSON 직렬화는 런타임 환경에 따라 cjson.safe 또는 cjson을 사용한다.
 local has_cjson_safe, cjson_safe = pcall(require, "cjson.safe")
@@ -285,21 +286,95 @@ local function build_runtime_ctx(params)
     identity = params.identity or {},
     identity_source = params.identity_source or {},
     units = params.units or 0,
+    current_usage = params.current_usage or 0,
     decision = params.decision or "allow",
     reason = params.reason or "unknown",
     route_id = params.route_id,
     remaining = remaining,
     policy_version = params.policy_version,
+    policy_source = params.policy_source,
+    policy_key = params.policy_key,
+    usage_scope = params.usage_scope,
+    usage_id = params.usage_id,
+    usage_month = params.usage_month,
+    usage_day = params.usage_day,
+    usage_keys = params.usage_keys or {},
+    ttl_seconds = params.ttl_seconds or {},
+    redis_error = params.redis_error,
+    usage_error = params.usage_error,
+    increment_error = params.increment_error,
   }
 end
 
--- 13.3 단계 access 실행 훅.
--- identity를 우선순위로 추출하고 유닛 계산 후 허용/차단을 결정한다.
+local function should_use_redis(conf)
+  if type(conf) ~= "table" then
+    return false
+  end
+
+  if type(conf.redis_client_factory) == "function" then
+    return true
+  end
+
+  return is_non_empty_string(conf.redis_host)
+end
+
+local function close_redis_client(client, is_factory_client)
+  if not client then
+    return
+  end
+  redis_store.close_client(client, is_factory_client)
+end
+
+local function resolve_policy(conf, identity, redis_client)
+  local scope, id, scope_err = redis_store.resolve_scope_and_id(identity)
+  if scope_err then
+    return nil, {
+      policy_source = "none",
+      policy_scope = nil,
+      policy_id = nil,
+      redis_error = scope_err,
+    }
+  end
+
+  local meta = {
+    policy_source = "none",
+    policy_scope = scope,
+    policy_id = id,
+    policy_key = nil,
+    redis_error = nil,
+  }
+
+  if redis_client then
+    local redis_policy, redis_meta, redis_err = redis_store.fetch_policy(redis_client, conf, identity)
+    if redis_err then
+      meta.redis_error = redis_err
+    elseif redis_policy then
+      meta.policy_source = redis_meta.policy_source or "redis"
+      meta.policy_scope = redis_meta.policy_scope or meta.policy_scope
+      meta.policy_id = redis_meta.policy_id or meta.policy_id
+      meta.policy_key = redis_meta.policy_key
+      return redis_policy, meta
+    else
+      meta.policy_source = "redis_miss"
+    end
+  end
+
+  if conf and type(conf.policy) == "table" then
+    meta.policy_source = "config"
+    return conf.policy, meta
+  end
+
+  return nil, meta
+end
+
+-- 13.4 단계 access 실행 훅.
+-- Redis 정책 조회와 month/day 사용량 카운터를 반영해 차단 여부를 결정한다.
 function plugin:access(conf)
   local identity, identity_source = extract_identity(conf)
   local route_id = get_route_id()
-  local policy = conf and conf.policy or nil
-  local policy_version = resolve_policy_version(policy)
+  local redis_client = nil
+  local redis_is_factory_client = false
+  local redis_error = nil
 
   local ok_identity = policy_model.validate_identity(identity)
   if not ok_identity then
@@ -310,7 +385,7 @@ function plugin:access(conf)
       decision = "deny",
       reason = "identity_missing",
       route_id = route_id,
-      policy_version = policy_version,
+      policy_version = nil,
       meta = {
         budget = nil,
         projected_usage = nil,
@@ -323,24 +398,52 @@ function plugin:access(conf)
     })
   end
 
-  if not policy then
+  if should_use_redis(conf) then
+    redis_client, redis_error, redis_is_factory_client = redis_store.open_client(conf)
+  end
+
+  local raw_policy, policy_meta = resolve_policy(conf, identity, redis_client)
+  if policy_meta and policy_meta.redis_error and not redis_error then
+    redis_error = policy_meta.redis_error
+  end
+
+  local policy_version = resolve_policy_version(raw_policy)
+  if not raw_policy then
+    local deny_when_missing = conf and conf.redis_policy_required == true
+    local decision_result = deny_when_missing and "deny" or "allow"
+
     set_runtime_ctx(build_runtime_ctx({
       identity = identity,
       identity_source = identity_source,
       units = 0,
-      decision = "allow",
+      decision = decision_result,
       reason = "policy_missing",
       route_id = route_id,
       policy_version = nil,
+      policy_source = policy_meta and policy_meta.policy_source or "none",
+      policy_key = policy_meta and policy_meta.policy_key or nil,
+      usage_scope = policy_meta and policy_meta.policy_scope or nil,
+      usage_id = policy_meta and policy_meta.policy_id or nil,
+      redis_error = redis_error,
       meta = {
         budget = nil,
         projected_usage = nil,
       },
     }))
+
+    close_redis_client(redis_client, redis_is_factory_client)
+
+    if deny_when_missing then
+      return exit_with_status(429, {
+        message = "policy is missing",
+        reason = "policy_missing",
+      })
+    end
+
     return
   end
 
-  local normalized_policy, normalize_err = policy_model.normalize_policy(policy)
+  local normalized_policy, normalize_err = policy_model.normalize_policy(raw_policy)
   if not normalized_policy or normalize_err then
     set_runtime_ctx(build_runtime_ctx({
       identity = identity,
@@ -350,11 +453,18 @@ function plugin:access(conf)
       reason = "policy_invalid",
       route_id = route_id,
       policy_version = policy_version,
+      policy_source = policy_meta and policy_meta.policy_source or "none",
+      policy_key = policy_meta and policy_meta.policy_key or nil,
+      usage_scope = policy_meta and policy_meta.policy_scope or nil,
+      usage_id = policy_meta and policy_meta.policy_id or nil,
+      redis_error = redis_error,
       meta = {
         budget = nil,
         projected_usage = nil,
       },
     }))
+
+    close_redis_client(redis_client, redis_is_factory_client)
     return
   end
 
@@ -380,52 +490,127 @@ function plugin:access(conf)
       reason = "units_calculation_failed",
       route_id = route_id,
       policy_version = policy_version,
+      policy_source = policy_meta and policy_meta.policy_source or "none",
+      policy_key = policy_meta and policy_meta.policy_key or nil,
+      usage_scope = policy_meta and policy_meta.policy_scope or nil,
+      usage_id = policy_meta and policy_meta.policy_id or nil,
+      redis_error = redis_error,
       meta = {
         budget = nil,
         projected_usage = nil,
       },
     }))
+
+    close_redis_client(redis_client, redis_is_factory_client)
     return
   end
 
+  local current_epoch = redis_store.current_epoch(conf)
+  local usage_scope = policy_meta and policy_meta.policy_scope or nil
+  local usage_id = policy_meta and policy_meta.policy_id or nil
+  local usage_keys = {}
+  local ttl_seconds = {}
+  local usage_month = 0
+  local usage_day = 0
+  local usage_error = nil
+
+  if redis_client and is_non_empty_string(usage_scope) and is_non_empty_string(usage_id) then
+    local usages, usage_meta, read_usage_err = redis_store.read_usages(redis_client, conf, usage_scope, usage_id, current_epoch)
+    if read_usage_err then
+      usage_error = read_usage_err
+    else
+      usage_month = usages.month or 0
+      usage_day = usages.day or 0
+      usage_keys = usage_meta.keys or {}
+      ttl_seconds = usage_meta.ttl_seconds or {}
+    end
+  end
+
+  local current_usage = math.max(tonumber(usage_month) or 0, tonumber(usage_day) or 0)
   local budget = resolve_budget(matched_rule, normalized_policy)
-  local result, meta, decision_err = decision.make_decision(0, budget, units, conf, normalized_policy)
+  local result, meta, decision_err = decision.make_decision(current_usage, budget, units, conf, normalized_policy)
   if decision_err then
     set_runtime_ctx(build_runtime_ctx({
       identity = identity,
       identity_source = identity_source,
       units = units,
+      current_usage = current_usage,
       decision = "allow",
       reason = "decision_error",
       route_id = route_id,
       policy_version = policy_version,
+      policy_source = policy_meta and policy_meta.policy_source or "none",
+      policy_key = policy_meta and policy_meta.policy_key or nil,
+      usage_scope = usage_scope,
+      usage_id = usage_id,
+      usage_month = usage_month,
+      usage_day = usage_day,
+      usage_keys = usage_keys,
+      ttl_seconds = ttl_seconds,
+      redis_error = redis_error,
+      usage_error = usage_error,
       meta = {
         budget = budget,
-        projected_usage = units,
+        projected_usage = current_usage + units,
       },
     }))
+
+    close_redis_client(redis_client, redis_is_factory_client)
     return
+  end
+
+  local increment_error = nil
+  if result == "allow" and redis_client and is_non_empty_string(usage_scope) and is_non_empty_string(usage_id) then
+    local increased, _, incr_err = redis_store.increment_usages(
+      redis_client,
+      conf,
+      usage_scope,
+      usage_id,
+      units,
+      current_epoch
+    )
+    if incr_err then
+      increment_error = incr_err
+    elseif type(increased) == "table" then
+      usage_month = increased.month or usage_month
+      usage_day = increased.day or usage_day
+    end
   end
 
   set_runtime_ctx(build_runtime_ctx({
     identity = identity,
     identity_source = identity_source,
     units = units,
+    current_usage = current_usage,
     decision = result,
     reason = meta and meta.reason or "unknown",
     route_id = route_id,
     policy_version = policy_version,
+    policy_source = policy_meta and policy_meta.policy_source or "none",
+    policy_key = policy_meta and policy_meta.policy_key or nil,
+    usage_scope = usage_scope,
+    usage_id = usage_id,
+    usage_month = usage_month,
+    usage_day = usage_day,
+    usage_keys = usage_keys,
+    ttl_seconds = ttl_seconds,
+    redis_error = redis_error,
+    usage_error = usage_error,
+    increment_error = increment_error,
     meta = meta,
   }))
 
   if result == "deny" then
     local deny_status = meta and meta.deny_status or 429
+    close_redis_client(redis_client, redis_is_factory_client)
     return exit_with_status(deny_status, {
       message = "budget exceeded",
       reason = meta.reason,
       units = units,
     })
   end
+
+  close_redis_client(redis_client, redis_is_factory_client)
 end
 
 -- 13.3 단계 log 실행 훅.
