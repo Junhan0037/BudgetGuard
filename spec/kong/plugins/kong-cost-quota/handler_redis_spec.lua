@@ -1,10 +1,51 @@
 -- 13.4 단계에서 핸들러가 Redis 정책/카운터를 사용하는 경로를 검증한다.
 local HANDLER_MODULE = "kong.plugins.kong-cost-quota.handler"
 local redis_store = require("kong.plugins.kong-cost-quota.redis_store")
+local policy_cache = require("kong.plugins.kong-cost-quota.policy_cache")
+
+local function new_fake_shared_dict(now_ref)
+  local data = {}
+
+  local function expired(item)
+    if not item or not item.expires_at then
+      return false
+    end
+    return now_ref() >= item.expires_at
+  end
+
+  return {
+    get = function(_, key)
+      local item = data[key]
+      if expired(item) then
+        data[key] = nil
+        return nil
+      end
+      return item and item.value or nil
+    end,
+    set = function(_, key, value, ttl)
+      local expires_at = nil
+      if ttl and ttl > 0 then
+        expires_at = now_ref() + ttl
+      end
+      data[key] = {
+        value = value,
+        expires_at = expires_at,
+      }
+      return true, nil
+    end,
+    delete = function(_, key)
+      data[key] = nil
+      return true
+    end,
+  }
+end
 
 local function setup_kong_env(opts)
   local options = opts or {}
   local exits = {}
+  local shared = options.shared or {}
+  local now_value = options.now_epoch or 0
+  local shared_dicts = options.shared_dicts or {}
 
   _G.kong = {
     request = {
@@ -39,7 +80,7 @@ local function setup_kong_env(opts)
       tls = {},
     },
     ctx = {
-      shared = options.shared or {},
+      shared = shared,
     },
     log = {
       notice = function()
@@ -50,6 +91,10 @@ local function setup_kong_env(opts)
 
   _G.ngx = {
     var = {},
+    shared = shared_dicts,
+    now = function()
+      return now_value
+    end,
   }
 
   return {
@@ -159,6 +204,7 @@ describe("handler redis path", function()
   local handler
 
   before_each(function()
+    policy_cache._reset_for_test()
     package.loaded[HANDLER_MODULE] = nil
     handler = require(HANDLER_MODULE)
   end)
@@ -345,5 +391,50 @@ describe("handler redis path", function()
     assert.are.equal("atomic_charge_failed", runtime_ctx.reason)
     assert.is_true(runtime_ctx.atomic)
     assert.is_truthy(runtime_ctx.atomic_error)
+  end)
+
+  it("uses cache_l1 source after the first redis policy fetch", function()
+    local now_epoch = 1772107200 -- 2026-02-26 12:00:00 UTC
+    local cache_dict = new_fake_shared_dict(function()
+      return now_epoch
+    end)
+    local redis = new_fake_redis({
+      store = {
+        ["policy:prod:client:client-cache"] = [[{"version":"cache-v1","deny_status_code":429,"default":{"base_weight":2,"plan_multiplier":1,"time_multiplier":1,"custom_multiplier":1,"budget":100},"rules":{},"plan_multipliers":{}}]],
+      },
+    })
+
+    setup_kong_env({
+      now_epoch = now_epoch,
+      shared = {
+        jwt_claims = {
+          client_id = "client-cache",
+        },
+      },
+      shared_dicts = {
+        kong_cost_quota_cache = cache_dict,
+      },
+    })
+
+    local conf = {
+      redis_host = "127.0.0.1",
+      redis_env = "prod",
+      usage_grace_days = 7,
+      redis_now_epoch = now_epoch,
+      redis_client_factory = function()
+        return redis
+      end,
+      policy_cache_enabled = true,
+      policy_cache_ttl_sec = 60,
+      policy_cache_shm = "kong_cost_quota_cache",
+      policy_cache_version_probe_sec = 5,
+      policy_cache_now_epoch = now_epoch,
+    }
+
+    handler:access(conf)
+    assert.are.equal("redis", kong.ctx.shared.cost_quota_ctx.policy_source)
+
+    handler:access(conf)
+    assert.are.equal("cache_l1", kong.ctx.shared.cost_quota_ctx.policy_source)
   end)
 end)

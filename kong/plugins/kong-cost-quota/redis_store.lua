@@ -1,6 +1,7 @@
 -- Redis 정책/사용량 저장소 모듈.
 -- 13.4 단계에서 정책 키 조회와 month/day 카운터 누적을 담당한다.
 local M = {}
+local policy_cache = require("kong.plugins.kong-cost-quota.policy_cache")
 
 local WINDOWS = { "month", "day" }
 local SCRIPT_KEY_COUNT = 2
@@ -398,6 +399,22 @@ local function ensure_number(value, default_value)
   return parsed
 end
 
+local function normalize_policy_version(policy)
+  if type(policy) ~= "table" then
+    return nil
+  end
+
+  if type(policy.version) == "string" then
+    return policy.version
+  end
+
+  if type(policy.version) == "number" then
+    return tostring(policy.version)
+  end
+
+  return nil
+end
+
 function M.resolve_scope_and_id(identity)
   if type(identity) ~= "table" then
     return nil, nil, "identity must be an object"
@@ -569,14 +586,10 @@ function M.close_client(client, is_factory_client)
   end
 end
 
-function M.fetch_policy(client, conf, identity)
-  if not client then
-    return nil, nil, "redis client is required"
-  end
-
+local function build_policy_candidates(conf, identity)
   local scope, id, scope_err = M.resolve_scope_and_id(identity)
   if scope_err then
-    return nil, nil, scope_err
+    return nil, scope_err
   end
 
   local env = get_env(conf)
@@ -597,31 +610,168 @@ function M.fetch_policy(client, conf, identity)
     }
   end
 
-  for _, candidate in ipairs(candidates) do
-    local raw_value, get_err = client:get(candidate.key)
-    if get_err then
-      return nil, nil, "failed to fetch policy: " .. tostring(get_err)
-    end
+  return candidates, nil
+end
 
-    if not is_redis_null(raw_value) then
-      local decoded, decode_err = decode_json(raw_value)
-      if decode_err then
-        return nil, nil, "failed to decode policy json: " .. tostring(decode_err)
-      end
-
-      return decoded, {
-        policy_key = candidate.key,
-        policy_source = "redis",
-        policy_scope = candidate.scope,
-        policy_id = candidate.id,
-      }, nil
-    end
+local function fetch_policy_from_key(client, key, scope, id)
+  local raw_value, get_err = client:get(key)
+  if get_err then
+    return nil, nil, "failed to fetch policy: " .. tostring(get_err), false
   end
 
-  return nil, {
+  if is_redis_null(raw_value) then
+    return nil, nil, nil, true
+  end
+
+  local decoded, decode_err = decode_json(raw_value)
+  if decode_err then
+    return nil, nil, "failed to decode policy json: " .. tostring(decode_err), false
+  end
+
+  local version = normalize_policy_version(decoded)
+  return decoded, {
+    policy_key = key,
     policy_source = "redis",
     policy_scope = scope,
     policy_id = id,
+    policy_version = version,
+    raw_policy = raw_value,
+    cache_hit = false,
+  }, nil, false
+end
+
+function M.fetch_policy(client, conf, identity)
+  if not client then
+    return nil, nil, "redis client is required"
+  end
+
+  local candidates, candidates_err = build_policy_candidates(conf, identity)
+  if candidates_err then
+    return nil, nil, candidates_err
+  end
+
+  for _, candidate in ipairs(candidates) do
+    local policy, meta, fetch_err, not_found = fetch_policy_from_key(client, candidate.key, candidate.scope, candidate.id)
+    if fetch_err then
+      return nil, nil, fetch_err
+    end
+
+    if not not_found then
+      return policy, meta, nil
+    end
+  end
+
+  local primary = candidates[1]
+  return nil, {
+    policy_source = "redis",
+    policy_scope = primary and primary.scope or nil,
+    policy_id = primary and primary.id or nil,
+    cache_hit = false,
+  }, nil
+end
+
+function M.fetch_policy_with_cache(client, conf, identity)
+  if not client then
+    return nil, nil, "redis client is required"
+  end
+
+  local candidates, candidates_err = build_policy_candidates(conf, identity)
+  if candidates_err then
+    return nil, nil, candidates_err
+  end
+
+  local cache_enabled = policy_cache.cache_enabled(conf)
+
+  for _, candidate in ipairs(candidates) do
+    if cache_enabled then
+      local cached_entry, cache_source = policy_cache.get_policy(conf, candidate.key)
+      if cached_entry and is_non_empty_string(cached_entry.raw_policy) then
+        local cached_policy, decode_err = decode_json(cached_entry.raw_policy)
+        if decode_err then
+          policy_cache.invalidate_policy(conf, candidate.key)
+        else
+          local cached_version = cached_entry.policy_version or normalize_policy_version(cached_policy)
+          local should_probe = policy_cache.should_probe_version(conf, candidate.key)
+          if should_probe then
+            local fresh_policy, fresh_meta, fresh_err, not_found = fetch_policy_from_key(
+              client,
+              candidate.key,
+              candidate.scope,
+              candidate.id
+            )
+
+            if fresh_err then
+              -- Redis 조회 실패 시 기존 캐시를 우선 사용해 fail-open 성격을 유지한다.
+              policy_cache.mark_probed(conf, candidate.key)
+              return cached_policy, {
+                policy_key = candidate.key,
+                policy_source = cache_source,
+                policy_scope = candidate.scope,
+                policy_id = candidate.id,
+                policy_version = cached_version,
+                cache_hit = true,
+                redis_error = fresh_err,
+              }, nil
+            end
+
+            if not not_found and fresh_policy then
+              local fresh_version = fresh_meta.policy_version
+              if fresh_version ~= cached_version then
+                policy_cache.set_policy(conf, candidate.key, {
+                  raw_policy = fresh_meta.raw_policy,
+                  policy_version = fresh_version,
+                })
+                policy_cache.mark_probed(conf, candidate.key)
+                return fresh_policy, fresh_meta, nil
+              end
+            elseif not_found then
+              policy_cache.invalidate_policy(conf, candidate.key)
+              -- 현재 후보가 삭제된 경우 다음 후보(org)를 탐색한다.
+              goto continue_candidate
+            end
+
+            policy_cache.mark_probed(conf, candidate.key)
+          end
+
+          return cached_policy, {
+            policy_key = candidate.key,
+            policy_source = cache_source,
+            policy_scope = candidate.scope,
+            policy_id = candidate.id,
+            policy_version = cached_version,
+            cache_hit = true,
+          }, nil
+        end
+      end
+    end
+
+    do
+      local policy, meta, fetch_err, not_found = fetch_policy_from_key(client, candidate.key, candidate.scope, candidate.id)
+      if fetch_err then
+        return nil, nil, fetch_err
+      end
+
+      if not not_found and policy then
+        if cache_enabled then
+          policy_cache.set_policy(conf, candidate.key, {
+            raw_policy = meta.raw_policy,
+            policy_version = meta.policy_version,
+          })
+          policy_cache.mark_probed(conf, candidate.key)
+        end
+        return policy, meta, nil
+      end
+    end
+
+    ::continue_candidate::
+  end
+
+  local primary = candidates[1]
+  return nil, {
+    policy_source = "redis_miss",
+    policy_scope = primary and primary.scope or nil,
+    policy_id = primary and primary.id or nil,
+    cache_hit = false,
   }, nil
 end
 

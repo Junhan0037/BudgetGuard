@@ -131,6 +131,59 @@ return {
               default = true,
             },
           },
+          {
+            policy_cache_enabled = {
+              type = "boolean",
+              required = false,
+              default = true,
+            },
+          },
+          {
+            policy_cache_ttl_sec = {
+              type = "integer",
+              required = false,
+              default = 60,
+              between = { 30, 120 },
+            },
+          },
+          {
+            emergency_mode = {
+              type = "boolean",
+              required = false,
+              default = false,
+            },
+          },
+          {
+            policy_cache_ttl_emergency_sec = {
+              type = "integer",
+              required = false,
+              default = 5,
+              between = { 5, 10 },
+            },
+          },
+          {
+            policy_cache_shm = {
+              type = "string",
+              required = false,
+              default = "kong_cost_quota_cache",
+            },
+          },
+          {
+            policy_cache_l1_size = {
+              type = "integer",
+              required = false,
+              default = 1024,
+              between = { 64, 65535 },
+            },
+          },
+          {
+            policy_cache_version_probe_sec = {
+              type = "integer",
+              required = false,
+              default = 5,
+              between = { 1, 30 },
+            },
+          },
         },
       },
     },

@@ -353,7 +353,7 @@ local function resolve_policy(conf, identity, redis_client)
   }
 
   if redis_client then
-    local redis_policy, redis_meta, redis_err = redis_store.fetch_policy(redis_client, conf, identity)
+    local redis_policy, redis_meta, redis_err = redis_store.fetch_policy_with_cache(redis_client, conf, identity)
     if redis_err then
       meta.redis_error = redis_err
     elseif redis_policy then
@@ -764,6 +764,7 @@ function plugin:log(conf)
     units = runtime_ctx.units,
     remaining = runtime_ctx.remaining,
     policy_version = runtime_ctx.policy_version,
+    policy_source = runtime_ctx.policy_source,
     decision = runtime_ctx.decision,
     reason = runtime_ctx.reason,
   }
