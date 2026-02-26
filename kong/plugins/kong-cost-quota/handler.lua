@@ -303,6 +303,14 @@ local function build_runtime_ctx(params)
     redis_error = params.redis_error,
     usage_error = params.usage_error,
     increment_error = params.increment_error,
+    atomic = params.atomic or false,
+    atomic_script_sha = params.atomic_script_sha,
+    atomic_error = params.atomic_error,
+    month_before = params.month_before,
+    day_before = params.day_before,
+    month_after = params.month_after,
+    day_after = params.day_after,
+    exceeded_by = params.exceeded_by,
   }
 end
 
@@ -513,21 +521,131 @@ function plugin:access(conf)
   local usage_month = 0
   local usage_day = 0
   local usage_error = nil
+  local current_usage = 0
+  local increment_error = nil
+  local atomic_script_sha = nil
+  local month_before = nil
+  local day_before = nil
+  local month_after = nil
+  local day_after = nil
+  local exceeded_by = nil
+  local atomic_enabled = not (conf and conf.redis_atomic_enabled == false)
+  local deny_status = decision.resolve_deny_status(conf, normalized_policy)
 
-  if redis_client and is_non_empty_string(usage_scope) and is_non_empty_string(usage_id) then
-    local usages, usage_meta, read_usage_err = redis_store.read_usages(redis_client, conf, usage_scope, usage_id, current_epoch)
-    if read_usage_err then
-      usage_error = read_usage_err
-    else
-      usage_month = usages.month or 0
-      usage_day = usages.day or 0
-      usage_keys = usage_meta.keys or {}
-      ttl_seconds = usage_meta.ttl_seconds or {}
+  local budget = resolve_budget(matched_rule, normalized_policy)
+
+  if redis_client and atomic_enabled and is_non_empty_string(usage_scope) and is_non_empty_string(usage_id) then
+    local atomic_result, atomic_meta, atomic_err = redis_store.atomic_charge_usages(
+      redis_client,
+      conf,
+      usage_scope,
+      usage_id,
+      units,
+      budget,
+      current_epoch
+    )
+
+    if atomic_err then
+      increment_error = atomic_err
+      set_runtime_ctx(build_runtime_ctx({
+        identity = identity,
+        identity_source = identity_source,
+        units = units,
+        current_usage = 0,
+        decision = "allow",
+        reason = "atomic_charge_failed",
+        route_id = route_id,
+        policy_version = policy_version,
+        policy_source = policy_meta and policy_meta.policy_source or "none",
+        policy_key = policy_meta and policy_meta.policy_key or nil,
+        usage_scope = usage_scope,
+        usage_id = usage_id,
+        usage_month = 0,
+        usage_day = 0,
+        usage_keys = usage_keys,
+        ttl_seconds = ttl_seconds,
+        redis_error = redis_error,
+        usage_error = usage_error,
+        increment_error = increment_error,
+        atomic = true,
+        atomic_error = atomic_err,
+        meta = {
+          budget = budget,
+          projected_usage = units,
+        },
+      }))
+
+      close_redis_client(redis_client, redis_is_factory_client)
+      return
     end
+
+    usage_keys = atomic_meta.keys or {}
+    ttl_seconds = atomic_meta.ttl_seconds or {}
+    atomic_script_sha = atomic_meta.script_sha
+
+    month_before = atomic_result.month_before
+    day_before = atomic_result.day_before
+    month_after = atomic_result.month_after
+    day_after = atomic_result.day_after
+    exceeded_by = atomic_result.exceeded_by
+    current_usage = atomic_result.current_usage_before or 0
+
+    local result = atomic_result.decision
+    local reason = atomic_result.reason
+    if result == "allow" then
+      usage_month = month_after
+      usage_day = day_after
+    else
+      usage_month = month_before
+      usage_day = day_before
+    end
+
+    set_runtime_ctx(build_runtime_ctx({
+      identity = identity,
+      identity_source = identity_source,
+      units = units,
+      current_usage = current_usage,
+      decision = result,
+      reason = reason,
+      route_id = route_id,
+      policy_version = policy_version,
+      policy_source = policy_meta and policy_meta.policy_source or "none",
+      policy_key = policy_meta and policy_meta.policy_key or nil,
+      usage_scope = usage_scope,
+      usage_id = usage_id,
+      usage_month = usage_month,
+      usage_day = usage_day,
+      usage_keys = usage_keys,
+      ttl_seconds = ttl_seconds,
+      redis_error = redis_error,
+      usage_error = usage_error,
+      atomic = true,
+      atomic_script_sha = atomic_script_sha,
+      month_before = month_before,
+      day_before = day_before,
+      month_after = month_after,
+      day_after = day_after,
+      exceeded_by = exceeded_by,
+      meta = {
+        budget = budget,
+        projected_usage = atomic_result.projected_usage,
+      },
+    }))
+
+    if result == "deny" then
+      close_redis_client(redis_client, redis_is_factory_client)
+      return exit_with_status(deny_status, {
+        message = "budget exceeded",
+        reason = reason,
+        units = units,
+      })
+    end
+
+    close_redis_client(redis_client, redis_is_factory_client)
+    return
   end
 
-  local current_usage = math.max(tonumber(usage_month) or 0, tonumber(usage_day) or 0)
-  local budget = resolve_budget(matched_rule, normalized_policy)
+  -- Redis 원자 경로를 사용하지 못할 때의 호환 경로다.
   local result, meta, decision_err = decision.make_decision(current_usage, budget, units, conf, normalized_policy)
   if decision_err then
     set_runtime_ctx(build_runtime_ctx({
@@ -559,9 +677,8 @@ function plugin:access(conf)
     return
   end
 
-  local increment_error = nil
   if result == "allow" and redis_client and is_non_empty_string(usage_scope) and is_non_empty_string(usage_id) then
-    local increased, _, incr_err = redis_store.increment_usages(
+    local increased, increased_meta, incr_err = redis_store.increment_usages(
       redis_client,
       conf,
       usage_scope,
@@ -574,6 +691,12 @@ function plugin:access(conf)
     elseif type(increased) == "table" then
       usage_month = increased.month or usage_month
       usage_day = increased.day or usage_day
+      usage_keys = increased_meta and increased_meta.keys or usage_keys
+      ttl_seconds = increased_meta and increased_meta.ttl_seconds or ttl_seconds
+      month_before = increased_meta and increased_meta.before and increased_meta.before.month or month_before
+      day_before = increased_meta and increased_meta.before and increased_meta.before.day or day_before
+      month_after = usage_month
+      day_after = usage_day
     end
   end
 
@@ -597,13 +720,19 @@ function plugin:access(conf)
     redis_error = redis_error,
     usage_error = usage_error,
     increment_error = increment_error,
+    atomic = false,
+    month_before = month_before,
+    day_before = day_before,
+    month_after = month_after,
+    day_after = day_after,
+    exceeded_by = exceeded_by,
     meta = meta,
   }))
 
   if result == "deny" then
-    local deny_status = meta and meta.deny_status or 429
+    local fallback_deny_status = meta and meta.deny_status or 429
     close_redis_client(redis_client, redis_is_factory_client)
-    return exit_with_status(deny_status, {
+    return exit_with_status(fallback_deny_status, {
       message = "budget exceeded",
       reason = meta.reason,
       units = units,

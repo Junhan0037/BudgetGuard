@@ -3,6 +3,70 @@
 local M = {}
 
 local WINDOWS = { "month", "day" }
+local SCRIPT_KEY_COUNT = 2
+
+-- month/day 카운터를 한 번에 처리하는 원자 차감 스크립트다.
+-- 반환 형식:
+-- { decision, reason, month_before, day_before, current_usage_before, projected_usage, month_after, day_after, exceeded_by }
+local ATOMIC_CHARGE_LUA = [[
+local month_key = KEYS[1]
+local day_key = KEYS[2]
+
+local units = tonumber(ARGV[1]) or 0
+local budget_arg = ARGV[2]
+local month_ttl = tonumber(ARGV[3]) or 1
+local day_ttl = tonumber(ARGV[4]) or 1
+
+if units < 0 then
+  return { "error", "units_must_be_non_negative", 0, 0, 0, 0, 0, 0, 0 }
+end
+
+local month_before = tonumber(redis.call("GET", month_key) or "0")
+local day_before = tonumber(redis.call("GET", day_key) or "0")
+
+local current_usage_before = month_before
+if day_before > current_usage_before then
+  current_usage_before = day_before
+end
+
+local projected_month = month_before + units
+local projected_day = day_before + units
+local projected_usage = projected_month
+if projected_day > projected_usage then
+  projected_usage = projected_day
+end
+
+if budget_arg ~= nil and budget_arg ~= "" then
+  local budget = tonumber(budget_arg)
+  if budget == nil then
+    return { "error", "budget_must_be_numeric", month_before, day_before, current_usage_before, projected_usage, month_before, day_before, 0 }
+  end
+
+  if projected_month > budget or projected_day > budget then
+    return { "deny", "budget_exceeded", month_before, day_before, current_usage_before, projected_usage, month_before, day_before, projected_usage - budget }
+  end
+end
+
+local month_after = tonumber(redis.call("INCRBY", month_key, units))
+local day_after = tonumber(redis.call("INCRBY", day_key, units))
+
+local month_ttl_now = tonumber(redis.call("TTL", month_key) or "-1")
+if month_ttl_now < 0 then
+  redis.call("EXPIRE", month_key, month_ttl)
+end
+
+local day_ttl_now = tonumber(redis.call("TTL", day_key) or "-1")
+if day_ttl_now < 0 then
+  redis.call("EXPIRE", day_key, day_ttl)
+end
+
+local reason = "within_budget"
+if budget_arg == nil or budget_arg == "" then
+  reason = "budget_missing"
+end
+
+return { "allow", reason, month_before, day_before, current_usage_before, projected_usage, month_after, day_after, 0 }
+]]
 
 local has_cjson_safe, cjson_safe = pcall(require, "cjson.safe")
 local has_cjson, cjson = pcall(require, "cjson")
@@ -354,6 +418,10 @@ function M.current_epoch(conf)
   return get_now_epoch(conf)
 end
 
+function M.atomic_charge_script()
+  return ATOMIC_CHARGE_LUA
+end
+
 function M.build_policy_key(env, scope, id)
   return string.format("policy:%s:%s:%s", env, scope, id)
 end
@@ -396,6 +464,36 @@ function M.compute_ttl_seconds(window, now_epoch, grace_days)
   end
 
   return ttl, nil
+end
+
+function M.build_usage_window_meta(conf, scope, id, now_epoch)
+  local env = get_env(conf)
+  local base_epoch = now_epoch or get_now_epoch(conf)
+  local grace_days = get_grace_days(conf)
+
+  local meta = {
+    keys = {},
+    buckets = {},
+    ttl_seconds = {},
+  }
+
+  for _, window in ipairs(WINDOWS) do
+    local bucket, bucket_err = M.compute_bucket(window, base_epoch)
+    if bucket_err then
+      return nil, bucket_err
+    end
+
+    local ttl_seconds, ttl_err = M.compute_ttl_seconds(window, base_epoch, grace_days)
+    if ttl_err then
+      return nil, ttl_err
+    end
+
+    meta.keys[window] = M.build_usage_key(env, window, scope, id, bucket)
+    meta.buckets[window] = bucket
+    meta.ttl_seconds[window] = ttl_seconds
+  end
+
+  return meta, nil
 end
 
 function M.open_client(conf)
@@ -532,29 +630,14 @@ function M.read_usages(client, conf, scope, id, now_epoch)
     return nil, nil, "redis client is required"
   end
 
-  local env = get_env(conf)
-  local base_epoch = now_epoch or get_now_epoch(conf)
-  local grace_days = get_grace_days(conf)
+  local meta, meta_err = M.build_usage_window_meta(conf, scope, id, now_epoch)
+  if meta_err then
+    return nil, nil, meta_err
+  end
 
   local usages = {}
-  local meta = {
-    keys = {},
-    buckets = {},
-    ttl_seconds = {},
-  }
-
   for _, window in ipairs(WINDOWS) do
-    local bucket, bucket_err = M.compute_bucket(window, base_epoch)
-    if bucket_err then
-      return nil, nil, bucket_err
-    end
-
-    local ttl_seconds, ttl_err = M.compute_ttl_seconds(window, base_epoch, grace_days)
-    if ttl_err then
-      return nil, nil, ttl_err
-    end
-
-    local key = M.build_usage_key(env, window, scope, id, bucket)
+    local key = meta.keys[window]
     local raw_usage, get_err = client:get(key)
     if get_err then
       return nil, nil, "failed to read usage: " .. tostring(get_err)
@@ -569,12 +652,179 @@ function M.read_usages(client, conf, scope, id, now_epoch)
     end
 
     usages[window] = usage_value
-    meta.keys[window] = key
-    meta.buckets[window] = bucket
-    meta.ttl_seconds[window] = ttl_seconds
   end
 
   return usages, meta, nil
+end
+
+local function parse_atomic_result(raw_result)
+  if type(raw_result) ~= "table" then
+    return nil, "atomic script result must be an array"
+  end
+
+  local decision_value = raw_result[1]
+  local reason_value = raw_result[2]
+  if decision_value == "error" then
+    return nil, tostring(reason_value or "unknown_script_error")
+  end
+
+  if decision_value ~= "allow" and decision_value ~= "deny" then
+    return nil, "invalid decision from atomic script: " .. tostring(decision_value)
+  end
+
+  local parsed = {
+    decision = decision_value,
+    reason = tostring(reason_value or "unknown"),
+    month_before = tonumber(raw_result[3]) or 0,
+    day_before = tonumber(raw_result[4]) or 0,
+    current_usage_before = tonumber(raw_result[5]) or 0,
+    projected_usage = tonumber(raw_result[6]) or 0,
+    month_after = tonumber(raw_result[7]) or 0,
+    day_after = tonumber(raw_result[8]) or 0,
+    exceeded_by = tonumber(raw_result[9]) or 0,
+  }
+
+  return parsed, nil
+end
+
+local function load_script_sha(client, script)
+  if type(client.script) == "function" then
+    return client:script("load", script)
+  end
+
+  if type(client.script_load) == "function" then
+    return client:script_load(script)
+  end
+
+  return nil, "script load is not supported by redis client"
+end
+
+local function call_evalsha(client, script_sha, keys, args)
+  if type(client.evalsha) ~= "function" then
+    return nil, "evalsha_not_supported"
+  end
+
+  return client:evalsha(
+    script_sha,
+    SCRIPT_KEY_COUNT,
+    keys.month,
+    keys.day,
+    args.units,
+    args.budget,
+    args.month_ttl,
+    args.day_ttl
+  )
+end
+
+local function call_eval(client, script, keys, args)
+  if type(client.eval) ~= "function" then
+    return nil, "eval_not_supported"
+  end
+
+  return client:eval(
+    script,
+    SCRIPT_KEY_COUNT,
+    keys.month,
+    keys.day,
+    args.units,
+    args.budget,
+    args.month_ttl,
+    args.day_ttl
+  )
+end
+
+function M.atomic_charge_usages(client, conf, scope, id, units, budget, now_epoch)
+  if not client then
+    return nil, nil, "redis client is required"
+  end
+
+  local charge_units = tonumber(units)
+  if not charge_units or charge_units < 0 then
+    return nil, nil, "units must be >= 0"
+  end
+
+  local meta, meta_err = M.build_usage_window_meta(conf, scope, id, now_epoch)
+  if meta_err then
+    return nil, nil, meta_err
+  end
+
+  local budget_value = budget
+  if budget_value ~= nil then
+    budget_value = tonumber(budget_value)
+    if not budget_value or budget_value < 0 then
+      return nil, nil, "budget must be >= 0"
+    end
+  end
+
+  local args = {
+    units = tostring(math.floor(charge_units)),
+    budget = budget_value == nil and "" or tostring(budget_value),
+    month_ttl = tostring(math.floor(meta.ttl_seconds.month)),
+    day_ttl = tostring(math.floor(meta.ttl_seconds.day)),
+  }
+
+  local script = ATOMIC_CHARGE_LUA
+  local script_sha = conf and conf.__atomic_charge_sha or nil
+  local raw_result = nil
+  local exec_err = nil
+
+  if is_non_empty_string(script_sha) then
+    raw_result, exec_err = call_evalsha(client, script_sha, meta.keys, args)
+  end
+
+  local should_load_script = false
+  if not raw_result and exec_err then
+    local err_text = tostring(exec_err)
+    if err_text:find("NOSCRIPT", 1, true) or err_text == "evalsha_not_supported" then
+      should_load_script = true
+    else
+      return nil, nil, "failed to execute evalsha: " .. err_text
+    end
+  elseif not raw_result and not exec_err then
+    should_load_script = true
+  end
+
+  if should_load_script then
+    local loaded_sha, load_err = load_script_sha(client, script)
+    if loaded_sha and conf then
+      conf.__atomic_charge_sha = tostring(loaded_sha)
+      script_sha = conf.__atomic_charge_sha
+      raw_result, exec_err = call_evalsha(client, script_sha, meta.keys, args)
+    end
+
+    if (not raw_result) and exec_err and tostring(exec_err):find("NOSCRIPT", 1, true) then
+      -- 드물게 로드 직후 NOSCRIPT가 발생하면 EVAL로 즉시 폴백한다.
+      raw_result, exec_err = call_eval(client, script, meta.keys, args)
+    elseif (not raw_result) and load_err then
+      raw_result, exec_err = call_eval(client, script, meta.keys, args)
+      if not raw_result and exec_err then
+        return nil, nil, "failed to execute eval after script load error: " .. tostring(exec_err)
+      end
+    elseif (not raw_result) and exec_err and tostring(exec_err) == "evalsha_not_supported" then
+      raw_result, exec_err = call_eval(client, script, meta.keys, args)
+    elseif (not raw_result) and exec_err then
+      return nil, nil, "failed to execute evalsha after script load: " .. tostring(exec_err)
+    end
+  end
+
+  if not raw_result then
+    raw_result, exec_err = call_eval(client, script, meta.keys, args)
+    if exec_err then
+      return nil, nil, "failed to execute atomic charge script: " .. tostring(exec_err)
+    end
+  end
+
+  local parsed, parse_err = parse_atomic_result(raw_result)
+  if parse_err then
+    return nil, nil, "failed to parse atomic script result: " .. tostring(parse_err)
+  end
+
+  return parsed, {
+    keys = meta.keys,
+    buckets = meta.buckets,
+    ttl_seconds = meta.ttl_seconds,
+    script_sha = is_non_empty_string(script_sha) and script_sha or (conf and conf.__atomic_charge_sha) or nil,
+  }, nil
 end
 
 function M.increment_usages(client, conf, scope, id, units, now_epoch)

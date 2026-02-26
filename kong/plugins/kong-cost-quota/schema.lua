@@ -124,6 +124,13 @@ return {
               default = false,
             },
           },
+          {
+            redis_atomic_enabled = {
+              type = "boolean",
+              required = false,
+              default = true,
+            },
+          },
         },
       },
     },

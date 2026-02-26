@@ -5,10 +5,57 @@ local function new_fake_redis(initial)
   local store = initial and initial.store or {}
   local ttl_map = initial and initial.ttl_map or {}
   local errors = initial and initial.errors or {}
+  local scripts = {}
+  local script_sequence = 0
+  local noscript_once = initial and initial.noscript_once or false
+
+  -- 테스트용 Redis Lua 실행기.
+  local function eval_atomic(month_key, day_key, units, budget_arg, month_ttl, day_ttl)
+    local charge_units = tonumber(units) or 0
+    local month_before = tonumber(store[month_key]) or 0
+    local day_before = tonumber(store[day_key]) or 0
+    local current_before = math.max(month_before, day_before)
+    local projected_usage = math.max(month_before + charge_units, day_before + charge_units)
+
+    if charge_units < 0 then
+      return { "error", "units_must_be_non_negative", 0, 0, 0, 0, 0, 0, 0 }, nil
+    end
+
+    if budget_arg ~= nil and budget_arg ~= "" then
+      local budget = tonumber(budget_arg)
+      if not budget then
+        return { "error", "budget_must_be_numeric", month_before, day_before, current_before, projected_usage, month_before, day_before, 0 }, nil
+      end
+
+      if (month_before + charge_units) > budget or (day_before + charge_units) > budget then
+        return { "deny", "budget_exceeded", month_before, day_before, current_before, projected_usage, month_before, day_before, projected_usage - budget }, nil
+      end
+    end
+
+    local month_after = month_before + charge_units
+    local day_after = day_before + charge_units
+    store[month_key] = tostring(month_after)
+    store[day_key] = tostring(day_after)
+
+    if (ttl_map[month_key] or -1) < 0 then
+      ttl_map[month_key] = tonumber(month_ttl)
+    end
+    if (ttl_map[day_key] or -1) < 0 then
+      ttl_map[day_key] = tonumber(day_ttl)
+    end
+
+    local reason = "within_budget"
+    if budget_arg == nil or budget_arg == "" then
+      reason = "budget_missing"
+    end
+
+    return { "allow", reason, month_before, day_before, current_before, projected_usage, month_after, day_after, 0 }, nil
+  end
 
   return {
     store = store,
     ttl_map = ttl_map,
+    scripts = scripts,
     get = function(_, key)
       if errors.get and errors.get[key] then
         return nil, errors.get[key]
@@ -30,6 +77,35 @@ local function new_fake_redis(initial)
     end,
     close = function()
       return true
+    end,
+    script = function(_, command, script_body)
+      if string.lower(command or "") ~= "load" then
+        return nil, "unsupported script command"
+      end
+      script_sequence = script_sequence + 1
+      local sha = "sha-" .. tostring(script_sequence)
+      scripts[sha] = script_body
+      return sha, nil
+    end,
+    evalsha = function(_, sha, numkeys, ...)
+      if noscript_once then
+        noscript_once = false
+        return nil, "NOSCRIPT No matching script. Please use EVAL."
+      end
+
+      local script_body = scripts[sha]
+      if not script_body then
+        return nil, "NOSCRIPT No matching script. Please use EVAL."
+      end
+
+      local values = { ... }
+      assert.are.equal(2, numkeys)
+      return eval_atomic(values[1], values[2], values[3], values[4], values[5], values[6])
+    end,
+    eval = function(_, _, numkeys, ...)
+      local values = { ... }
+      assert.are.equal(2, numkeys)
+      return eval_atomic(values[1], values[2], values[3], values[4], values[5], values[6])
     end,
   }
 end
@@ -122,5 +198,102 @@ describe("redis_store", function()
     assert.are.equal(3, meta.before.day)
     assert.are.equal(820800, redis.ttl_map["usage:prod:month:client:client-1:2026-02"])
     assert.are.equal(648000, redis.ttl_map["usage:prod:day:client:client-1:2026-02-26"])
+  end)
+
+  it("charges atomically and returns allow with updated usage", function()
+    local now_epoch = 1772107200 -- 2026-02-26 12:00:00 UTC
+    local redis = new_fake_redis({
+      store = {
+        ["usage:prod:month:client:client-1:2026-02"] = "1",
+        ["usage:prod:day:client:client-1:2026-02-26"] = "2",
+      },
+    })
+
+    local result, meta, err = redis_store.atomic_charge_usages(redis, {
+      redis_env = "prod",
+      usage_grace_days = 7,
+    }, "client", "client-1", 3, 10, now_epoch)
+
+    assert.is_nil(err)
+    assert.are.equal("allow", result.decision)
+    assert.are.equal("within_budget", result.reason)
+    assert.are.equal(1, result.month_before)
+    assert.are.equal(2, result.day_before)
+    assert.are.equal(4, result.month_after)
+    assert.are.equal(5, result.day_after)
+    assert.is_truthy(meta.script_sha)
+    assert.are.equal(820800, redis.ttl_map["usage:prod:month:client:client-1:2026-02"])
+    assert.are.equal(648000, redis.ttl_map["usage:prod:day:client:client-1:2026-02-26"])
+  end)
+
+  it("returns deny and does not change counters when budget is exceeded", function()
+    local now_epoch = 1772107200 -- 2026-02-26 12:00:00 UTC
+    local redis = new_fake_redis({
+      store = {
+        ["usage:prod:month:client:client-1:2026-02"] = "9",
+        ["usage:prod:day:client:client-1:2026-02-26"] = "1",
+      },
+    })
+
+    local result, _, err = redis_store.atomic_charge_usages(redis, {
+      redis_env = "prod",
+      usage_grace_days = 7,
+    }, "client", "client-1", 2, 10, now_epoch)
+
+    assert.is_nil(err)
+    assert.are.equal("deny", result.decision)
+    assert.are.equal("budget_exceeded", result.reason)
+    assert.are.equal(9, result.month_before)
+    assert.are.equal(1, result.day_before)
+    assert.are.equal(9, result.month_after)
+    assert.are.equal(1, result.day_after)
+    assert.are.equal("9", redis.store["usage:prod:month:client:client-1:2026-02"])
+    assert.are.equal("1", redis.store["usage:prod:day:client:client-1:2026-02-26"])
+  end)
+
+  it("reloads script when evalsha returns NOSCRIPT", function()
+    local now_epoch = 1772107200 -- 2026-02-26 12:00:00 UTC
+    local redis = new_fake_redis({
+      noscript_once = true,
+    })
+    local conf = {
+      redis_env = "prod",
+      usage_grace_days = 7,
+      __atomic_charge_sha = "stale-sha",
+    }
+
+    local result, meta, err = redis_store.atomic_charge_usages(redis, conf, "client", "client-1", 1, 5, now_epoch)
+
+    assert.is_nil(err)
+    assert.are.equal("allow", result.decision)
+    assert.is_truthy(meta.script_sha)
+    assert.are_not.equal("stale-sha", meta.script_sha)
+  end)
+
+  it("keeps accurate cutoff point under 1000 charge attempts", function()
+    local now_epoch = 1772107200 -- 2026-02-26 12:00:00 UTC
+    local redis = new_fake_redis({})
+    local conf = {
+      redis_env = "prod",
+      usage_grace_days = 7,
+    }
+    local budget = 300
+    local allow_count = 0
+    local deny_count = 0
+
+    for _ = 1, 1000 do
+      local result, _, err = redis_store.atomic_charge_usages(redis, conf, "client", "client-1", 1, budget, now_epoch)
+      assert.is_nil(err)
+      if result.decision == "allow" then
+        allow_count = allow_count + 1
+      else
+        deny_count = deny_count + 1
+      end
+    end
+
+    assert.are.equal(300, allow_count)
+    assert.are.equal(700, deny_count)
+    assert.are.equal("300", redis.store["usage:prod:month:client:client-1:2026-02"])
+    assert.are.equal("300", redis.store["usage:prod:day:client:client-1:2026-02-26"])
   end)
 end)

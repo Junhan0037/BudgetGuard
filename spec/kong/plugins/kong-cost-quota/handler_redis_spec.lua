@@ -65,6 +65,46 @@ end
 local function new_fake_redis(initial)
   local store = initial and initial.store or {}
   local ttl_map = initial and initial.ttl_map or {}
+  local scripts = {}
+  local script_sequence = 0
+  local force_eval_error = initial and initial.force_eval_error
+
+  local function eval_atomic(month_key, day_key, units, budget_arg, month_ttl, day_ttl)
+    local charge_units = tonumber(units) or 0
+    local month_before = tonumber(store[month_key]) or 0
+    local day_before = tonumber(store[day_key]) or 0
+    local current_before = math.max(month_before, day_before)
+    local projected_usage = math.max(month_before + charge_units, day_before + charge_units)
+
+    if force_eval_error then
+      return nil, force_eval_error
+    end
+
+    if budget_arg ~= nil and budget_arg ~= "" then
+      local budget = tonumber(budget_arg)
+      if (month_before + charge_units) > budget or (day_before + charge_units) > budget then
+        return { "deny", "budget_exceeded", month_before, day_before, current_before, projected_usage, month_before, day_before, projected_usage - budget }, nil
+      end
+    end
+
+    local month_after = month_before + charge_units
+    local day_after = day_before + charge_units
+    store[month_key] = tostring(month_after)
+    store[day_key] = tostring(day_after)
+
+    if (ttl_map[month_key] or -1) < 0 then
+      ttl_map[month_key] = tonumber(month_ttl)
+    end
+    if (ttl_map[day_key] or -1) < 0 then
+      ttl_map[day_key] = tonumber(day_ttl)
+    end
+
+    local reason = "within_budget"
+    if budget_arg == nil or budget_arg == "" then
+      reason = "budget_missing"
+    end
+    return { "allow", reason, month_before, day_before, current_before, projected_usage, month_after, day_after, 0 }, nil
+  end
 
   return {
     store = store,
@@ -87,6 +127,30 @@ local function new_fake_redis(initial)
     end,
     close = function()
       return true
+    end,
+    script = function(_, command, script_body)
+      if string.lower(command or "") ~= "load" then
+        return nil, "unsupported script command"
+      end
+      script_sequence = script_sequence + 1
+      local sha = "sha-" .. tostring(script_sequence)
+      scripts[sha] = script_body
+      return sha, nil
+    end,
+    evalsha = function(_, sha, numkeys, ...)
+      local script_body = scripts[sha]
+      if not script_body then
+        return nil, "NOSCRIPT No matching script. Please use EVAL."
+      end
+
+      local values = { ... }
+      assert.are.equal(2, numkeys)
+      return eval_atomic(values[1], values[2], values[3], values[4], values[5], values[6])
+    end,
+    eval = function(_, _, numkeys, ...)
+      local values = { ... }
+      assert.are.equal(2, numkeys)
+      return eval_atomic(values[1], values[2], values[3], values[4], values[5], values[6])
     end,
   }
 end
@@ -132,6 +196,7 @@ describe("handler redis path", function()
     local runtime_ctx = kong.ctx.shared.cost_quota_ctx
     assert.is_table(runtime_ctx)
     assert.are.equal("allow", runtime_ctx.decision)
+    assert.is_true(runtime_ctx.atomic)
     assert.are.equal("redis", runtime_ctx.policy_source)
     assert.are.equal("policy:prod:client:client-1", runtime_ctx.policy_key)
     assert.are.equal("client", runtime_ctx.usage_scope)
@@ -174,6 +239,7 @@ describe("handler redis path", function()
 
     local runtime_ctx = kong.ctx.shared.cost_quota_ctx
     assert.is_table(runtime_ctx)
+    assert.is_true(runtime_ctx.atomic)
     assert.are.equal("policy:prod:org:org-1", runtime_ctx.policy_key)
     assert.are.equal("org", runtime_ctx.usage_scope)
     assert.are.equal("org-1", runtime_ctx.usage_id)
@@ -243,5 +309,41 @@ describe("handler redis path", function()
     assert.are.equal("budget_exceeded", env.exits[1].body.reason)
     assert.are.equal("9", redis.store[month_key])
     assert.are.equal("1", redis.store[day_key])
+  end)
+
+  it("fails open when atomic script execution fails", function()
+    local now_epoch = 1772107200 -- 2026-02-26 12:00:00 UTC
+    local redis = new_fake_redis({
+      store = {
+        ["policy:prod:client:client-1"] = [[{"version":"redis-v1","deny_status_code":429,"default":{"base_weight":2,"plan_multiplier":1,"time_multiplier":1,"custom_multiplier":1,"budget":10},"rules":{},"plan_multipliers":{}}]],
+      },
+      force_eval_error = "ERR simulated script failure",
+    })
+
+    local env = setup_kong_env({
+      shared = {
+        jwt_claims = {
+          client_id = "client-1",
+        },
+      },
+    })
+
+    local result = handler:access({
+      redis_host = "127.0.0.1",
+      redis_env = "prod",
+      usage_grace_days = 7,
+      redis_now_epoch = now_epoch,
+      redis_client_factory = function()
+        return redis
+      end,
+    })
+
+    assert.are.equal(0, #env.exits)
+    assert.is_nil(result)
+    local runtime_ctx = kong.ctx.shared.cost_quota_ctx
+    assert.are.equal("allow", runtime_ctx.decision)
+    assert.are.equal("atomic_charge_failed", runtime_ctx.reason)
+    assert.is_true(runtime_ctx.atomic)
+    assert.is_truthy(runtime_ctx.atomic_error)
   end)
 end)
