@@ -51,6 +51,20 @@ return {
               between = { 0, math.huge },
             },
           },
+          {
+            allow_trusted_identity_headers = {
+              type = "boolean",
+              required = false,
+              default = false,
+            },
+          },
+          {
+            audit_log_enabled = {
+              type = "boolean",
+              required = false,
+              default = true,
+            },
+          },
         },
       },
     },

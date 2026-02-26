@@ -81,6 +81,12 @@ local function normalize_rule(rule, defaults, context, errors)
   end
   custom_multiplier = validate_non_negative_number(custom_multiplier, context .. ".custom_multiplier", errors)
 
+  -- budget은 선택 항목이며, 지정된 경우 음수가 아니어야 한다.
+  local budget = nil
+  if rule.budget ~= nil then
+    budget = validate_non_negative_number(rule.budget, context .. ".budget", errors)
+  end
+
   if not base_weight or not plan_multiplier or not time_multiplier or not custom_multiplier then
     return nil
   end
@@ -90,6 +96,7 @@ local function normalize_rule(rule, defaults, context, errors)
     plan_multiplier = plan_multiplier,
     time_multiplier = time_multiplier,
     custom_multiplier = custom_multiplier,
+    budget = budget,
   }
 end
 

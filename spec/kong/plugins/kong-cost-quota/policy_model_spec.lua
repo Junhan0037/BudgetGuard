@@ -25,6 +25,26 @@ describe("policy_model", function()
     assert.is_truthy(err)
   end)
 
+  it("normalizes optional budget and validates non-negative value", function()
+    local policy_ok, err_ok = policy_model.normalize_policy({
+      default = {
+        budget = 100,
+      },
+      rules = {},
+    })
+    local policy_bad, err_bad = policy_model.normalize_policy({
+      default = {
+        budget = -1,
+      },
+      rules = {},
+    })
+
+    assert.is_nil(err_ok)
+    assert.are.equal(100, policy_ok.default.budget)
+    assert.is_nil(policy_bad)
+    assert.is_truthy(err_bad)
+  end)
+
   it("rejects unsupported deny status code", function()
     local policy, err = policy_model.normalize_policy({
       deny_status_code = 500,
