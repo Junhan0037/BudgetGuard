@@ -3,6 +3,7 @@ local route_matcher = require("kong.plugins.kong-cost-quota.route_matcher")
 local unit_calculator = require("kong.plugins.kong-cost-quota.unit_calculator")
 local decision = require("kong.plugins.kong-cost-quota.decision")
 local redis_store = require("kong.plugins.kong-cost-quota.redis_store")
+local failure_control = require("kong.plugins.kong-cost-quota.failure_control")
 
 -- JSON 직렬화는 런타임 환경에 따라 cjson.safe 또는 cjson을 사용한다.
 local has_cjson_safe, cjson_safe = pcall(require, "cjson.safe")
@@ -108,6 +109,14 @@ local function log_notice(message)
   end
 end
 
+local function log_warn(message)
+  if kong and kong.log and kong.log.warn then
+    kong.log.warn(message)
+    return
+  end
+  log_notice(message)
+end
+
 local function exit_with_status(status_code, body)
   if kong and kong.response and kong.response.exit then
     return kong.response.exit(status_code, body)
@@ -116,6 +125,11 @@ local function exit_with_status(status_code, body)
     status = status_code,
     body = body,
   }
+end
+
+local function emit_failure_alarm(payload)
+  -- 운영 알람 연계를 위해 장애 이벤트를 구조화 로그로 남긴다.
+  log_warn("cost_quota_failure " .. encode_json(payload))
 end
 
 local function copy_non_empty_fields(source)
@@ -311,6 +325,10 @@ local function build_runtime_ctx(params)
     month_after = params.month_after,
     day_after = params.day_after,
     exceeded_by = params.exceeded_by,
+    failure_strategy = params.failure_strategy,
+    failure_source = params.failure_source,
+    failure_deny_status = params.failure_deny_status,
+    redis_circuit_open = params.redis_circuit_open,
   }
 end
 
@@ -375,6 +393,65 @@ local function resolve_policy(conf, identity, redis_client)
   return nil, meta
 end
 
+local function apply_failure_strategy(conf, params)
+  local strategy = failure_control.resolve_failure_strategy(conf)
+  local deny_status = failure_control.resolve_failure_deny_status(conf)
+  local decision_value = strategy == "fail_closed" and "deny" or "allow"
+  local reason_prefix = params.reason_prefix or "redis_failure"
+  local reason = reason_prefix .. "_" .. strategy
+
+  emit_failure_alarm({
+    route_id = params.route_id,
+    reason = reason,
+    strategy = strategy,
+    deny_status = deny_status,
+    source = params.failure_source,
+    redis_error = params.redis_error,
+    policy_source = params.policy_source,
+  })
+
+  set_runtime_ctx(build_runtime_ctx({
+    identity = params.identity,
+    identity_source = params.identity_source,
+    units = params.units or 0,
+    current_usage = params.current_usage or 0,
+    decision = decision_value,
+    reason = reason,
+    route_id = params.route_id,
+    policy_version = params.policy_version,
+    policy_source = params.policy_source or "redis_failure",
+    policy_key = params.policy_key,
+    usage_scope = params.usage_scope,
+    usage_id = params.usage_id,
+    usage_month = params.usage_month or 0,
+    usage_day = params.usage_day or 0,
+    usage_keys = params.usage_keys or {},
+    ttl_seconds = params.ttl_seconds or {},
+    redis_error = params.redis_error,
+    usage_error = params.usage_error,
+    increment_error = params.increment_error,
+    atomic = params.atomic or false,
+    atomic_error = params.atomic_error,
+    failure_strategy = strategy,
+    failure_source = params.failure_source,
+    failure_deny_status = deny_status,
+    redis_circuit_open = params.redis_circuit_open or false,
+    meta = params.meta or {
+      budget = nil,
+      projected_usage = nil,
+    },
+  }))
+
+  if decision_value == "deny" then
+    return exit_with_status(deny_status, {
+      message = "redis is unavailable",
+      reason = reason,
+    }), true
+  end
+
+  return nil, true
+end
+
 -- 13.4 단계 access 실행 훅.
 -- Redis 정책 조회와 month/day 사용량 카운터를 반영해 차단 여부를 결정한다.
 function plugin:access(conf)
@@ -383,6 +460,8 @@ function plugin:access(conf)
   local redis_client = nil
   local redis_is_factory_client = false
   local redis_error = nil
+  local redis_requested = should_use_redis(conf)
+  local redis_had_failure = false
 
   local ok_identity = policy_model.validate_identity(identity)
   if not ok_identity then
@@ -406,8 +485,39 @@ function plugin:access(conf)
     })
   end
 
-  if should_use_redis(conf) then
+  if redis_requested then
+    local circuit_open, circuit_meta = failure_control.is_circuit_open(conf)
+    if circuit_open then
+      local response = nil
+      response = select(1, apply_failure_strategy(conf, {
+        identity = identity,
+        identity_source = identity_source,
+        route_id = route_id,
+        reason_prefix = "redis_circuit_open",
+        failure_source = circuit_meta and circuit_meta.source or "redis_circuit_open",
+        redis_error = "redis circuit breaker is open",
+        policy_source = "circuit_open",
+        redis_circuit_open = true,
+      }))
+      return response
+    end
+
     redis_client, redis_error, redis_is_factory_client = redis_store.open_client(conf)
+    if not redis_client then
+      redis_had_failure = true
+      failure_control.record_redis_result(conf, false)
+      local response = nil
+      response = select(1, apply_failure_strategy(conf, {
+        identity = identity,
+        identity_source = identity_source,
+        route_id = route_id,
+        reason_prefix = "redis_connect_failed",
+        failure_source = "redis_connect",
+        redis_error = redis_error,
+        policy_source = "redis_connect_error",
+      }))
+      return response
+    end
   end
 
   local raw_policy, policy_meta = resolve_policy(conf, identity, redis_client)
@@ -415,8 +525,31 @@ function plugin:access(conf)
     redis_error = policy_meta.redis_error
   end
 
+  if redis_requested and is_non_empty_string(redis_error) then
+    redis_had_failure = true
+    failure_control.record_redis_result(conf, false)
+  end
+
   local policy_version = resolve_policy_version(raw_policy)
   if not raw_policy then
+    if redis_requested and is_non_empty_string(redis_error) then
+      close_redis_client(redis_client, redis_is_factory_client)
+      local response = nil
+      response = select(1, apply_failure_strategy(conf, {
+        identity = identity,
+        identity_source = identity_source,
+        route_id = route_id,
+        reason_prefix = "redis_policy_fetch_failed",
+        failure_source = "redis_policy_fetch",
+        redis_error = redis_error,
+        policy_source = policy_meta and policy_meta.policy_source or "redis_error",
+        policy_key = policy_meta and policy_meta.policy_key or nil,
+        usage_scope = policy_meta and policy_meta.policy_scope or nil,
+        usage_id = policy_meta and policy_meta.policy_id or nil,
+      }))
+      return response
+    end
+
     local deny_when_missing = conf and conf.redis_policy_required == true
     local decision_result = deny_when_missing and "deny" or "allow"
 
@@ -448,6 +581,9 @@ function plugin:access(conf)
       })
     end
 
+    if redis_requested and not redis_had_failure then
+      failure_control.record_redis_result(conf, true)
+    end
     return
   end
 
@@ -473,6 +609,9 @@ function plugin:access(conf)
     }))
 
     close_redis_client(redis_client, redis_is_factory_client)
+    if redis_requested and not redis_had_failure then
+      failure_control.record_redis_result(conf, true)
+    end
     return
   end
 
@@ -510,6 +649,9 @@ function plugin:access(conf)
     }))
 
     close_redis_client(redis_client, redis_is_factory_client)
+    if redis_requested and not redis_had_failure then
+      failure_control.record_redis_result(conf, true)
+    end
     return
   end
 
@@ -547,13 +689,15 @@ function plugin:access(conf)
 
     if atomic_err then
       increment_error = atomic_err
-      set_runtime_ctx(build_runtime_ctx({
+      close_redis_client(redis_client, redis_is_factory_client)
+      redis_had_failure = true
+      failure_control.record_redis_result(conf, false)
+      local response = nil
+      response = select(1, apply_failure_strategy(conf, {
         identity = identity,
         identity_source = identity_source,
         units = units,
         current_usage = 0,
-        decision = "allow",
-        reason = "atomic_charge_failed",
         route_id = route_id,
         policy_version = policy_version,
         policy_source = policy_meta and policy_meta.policy_source or "none",
@@ -569,14 +713,14 @@ function plugin:access(conf)
         increment_error = increment_error,
         atomic = true,
         atomic_error = atomic_err,
+        reason_prefix = "atomic_charge_failed",
+        failure_source = "redis_atomic_charge",
         meta = {
           budget = budget,
           projected_usage = units,
         },
       }))
-
-      close_redis_client(redis_client, redis_is_factory_client)
-      return
+      return response
     end
 
     usage_keys = atomic_meta.keys or {}
@@ -634,6 +778,9 @@ function plugin:access(conf)
 
     if result == "deny" then
       close_redis_client(redis_client, redis_is_factory_client)
+      if redis_requested and not redis_had_failure then
+        failure_control.record_redis_result(conf, true)
+      end
       return exit_with_status(deny_status, {
         message = "budget exceeded",
         reason = reason,
@@ -642,6 +789,9 @@ function plugin:access(conf)
     end
 
     close_redis_client(redis_client, redis_is_factory_client)
+    if redis_requested and not redis_had_failure then
+      failure_control.record_redis_result(conf, true)
+    end
     return
   end
 
@@ -674,6 +824,9 @@ function plugin:access(conf)
     }))
 
     close_redis_client(redis_client, redis_is_factory_client)
+    if redis_requested and not redis_had_failure then
+      failure_control.record_redis_result(conf, true)
+    end
     return
   end
 
@@ -688,6 +841,37 @@ function plugin:access(conf)
     )
     if incr_err then
       increment_error = incr_err
+      close_redis_client(redis_client, redis_is_factory_client)
+      redis_had_failure = true
+      failure_control.record_redis_result(conf, false)
+      local response = nil
+      response = select(1, apply_failure_strategy(conf, {
+        identity = identity,
+        identity_source = identity_source,
+        units = units,
+        current_usage = current_usage,
+        route_id = route_id,
+        policy_version = policy_version,
+        policy_source = policy_meta and policy_meta.policy_source or "none",
+        policy_key = policy_meta and policy_meta.policy_key or nil,
+        usage_scope = usage_scope,
+        usage_id = usage_id,
+        usage_month = usage_month,
+        usage_day = usage_day,
+        usage_keys = usage_keys,
+        ttl_seconds = ttl_seconds,
+        redis_error = redis_error,
+        usage_error = usage_error,
+        increment_error = increment_error,
+        atomic = false,
+        reason_prefix = "usage_increment_failed",
+        failure_source = "redis_increment",
+        meta = {
+          budget = budget,
+          projected_usage = current_usage + units,
+        },
+      }))
+      return response
     elseif type(increased) == "table" then
       usage_month = increased.month or usage_month
       usage_day = increased.day or usage_day
@@ -732,6 +916,9 @@ function plugin:access(conf)
   if result == "deny" then
     local fallback_deny_status = meta and meta.deny_status or 429
     close_redis_client(redis_client, redis_is_factory_client)
+    if redis_requested and not redis_had_failure then
+      failure_control.record_redis_result(conf, true)
+    end
     return exit_with_status(fallback_deny_status, {
       message = "budget exceeded",
       reason = meta.reason,
@@ -740,6 +927,9 @@ function plugin:access(conf)
   end
 
   close_redis_client(redis_client, redis_is_factory_client)
+  if redis_requested and not redis_had_failure then
+    failure_control.record_redis_result(conf, true)
+  end
 end
 
 -- 13.3 단계 log 실행 훅.

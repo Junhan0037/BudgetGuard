@@ -399,6 +399,18 @@ local function ensure_number(value, default_value)
   return parsed
 end
 
+local function resolve_timeout_budget_ms(conf)
+  -- PRD 13.7 기준으로 Redis 타임아웃 예산(5~20ms)을 강제한다.
+  local timeout = ensure_number(conf and conf.redis_timeout_ms, 20)
+  if timeout < 5 then
+    timeout = 5
+  end
+  if timeout > 20 then
+    timeout = 20
+  end
+  return timeout
+end
+
 local function normalize_policy_version(policy)
   if type(policy) ~= "table" then
     return nil
@@ -536,7 +548,7 @@ function M.open_client(conf)
     return nil, "failed to create redis client", false
   end
 
-  local timeout = ensure_number(conf.redis_timeout_ms, 20)
+  local timeout = resolve_timeout_budget_ms(conf)
   if type(client.set_timeout) == "function" then
     client:set_timeout(timeout)
   end

@@ -2,6 +2,7 @@
 local HANDLER_MODULE = "kong.plugins.kong-cost-quota.handler"
 local redis_store = require("kong.plugins.kong-cost-quota.redis_store")
 local policy_cache = require("kong.plugins.kong-cost-quota.policy_cache")
+local failure_control = require("kong.plugins.kong-cost-quota.failure_control")
 
 local function new_fake_shared_dict(now_ref)
   local data = {}
@@ -32,6 +33,22 @@ local function new_fake_shared_dict(now_ref)
         expires_at = expires_at,
       }
       return true, nil
+    end,
+    incr = function(_, key, value)
+      local item = data[key]
+      if expired(item) then
+        data[key] = nil
+        item = nil
+      end
+
+      if not item then
+        return nil, "not found"
+      end
+
+      local current = tonumber(item.value) or 0
+      local next_value = current + value
+      item.value = next_value
+      return next_value, nil
     end,
     delete = function(_, key)
       data[key] = nil
@@ -205,6 +222,7 @@ describe("handler redis path", function()
 
   before_each(function()
     policy_cache._reset_for_test()
+    failure_control._reset_for_test()
     package.loaded[HANDLER_MODULE] = nil
     handler = require(HANDLER_MODULE)
   end)
@@ -388,9 +406,138 @@ describe("handler redis path", function()
     assert.is_nil(result)
     local runtime_ctx = kong.ctx.shared.cost_quota_ctx
     assert.are.equal("allow", runtime_ctx.decision)
-    assert.are.equal("atomic_charge_failed", runtime_ctx.reason)
+    assert.are.equal("atomic_charge_failed_fail_open", runtime_ctx.reason)
     assert.is_true(runtime_ctx.atomic)
     assert.is_truthy(runtime_ctx.atomic_error)
+  end)
+
+  it("fails closed when redis connection fails", function()
+    local env = setup_kong_env({
+      shared = {
+        jwt_claims = {
+          client_id = "client-1",
+        },
+      },
+    })
+
+    local result = handler:access({
+      redis_host = "127.0.0.1",
+      redis_env = "prod",
+      failure_strategy = "fail_closed",
+      failure_deny_status = 503,
+      redis_client_factory = function()
+        return nil, "timeout"
+      end,
+    })
+
+    assert.are.equal(1, #env.exits)
+    assert.are.equal(503, env.exits[1].status)
+    assert.are.equal(503, result.status)
+    assert.is_truthy(env.exits[1].body.reason:find("redis_connect_failed_fail_closed", 1, true))
+    assert.are.equal("deny", kong.ctx.shared.cost_quota_ctx.decision)
+  end)
+
+  it("keeps fail-open default when redis connection fails", function()
+    local env = setup_kong_env({
+      shared = {
+        jwt_claims = {
+          client_id = "client-1",
+        },
+      },
+    })
+
+    local result = handler:access({
+      redis_host = "127.0.0.1",
+      redis_env = "prod",
+      redis_client_factory = function()
+        return nil, "timeout"
+      end,
+    })
+
+    assert.are.equal(0, #env.exits)
+    assert.is_nil(result)
+    assert.are.equal("allow", kong.ctx.shared.cost_quota_ctx.decision)
+    assert.is_truthy(kong.ctx.shared.cost_quota_ctx.reason:find("redis_connect_failed_fail_open", 1, true))
+  end)
+
+  it("fails closed when atomic script execution fails under fail_closed", function()
+    local now_epoch = 1772107200 -- 2026-02-26 12:00:00 UTC
+    local redis = new_fake_redis({
+      store = {
+        ["policy:prod:client:client-1"] = [[{"version":"redis-v1","deny_status_code":429,"default":{"base_weight":2,"plan_multiplier":1,"time_multiplier":1,"custom_multiplier":1,"budget":10},"rules":{},"plan_multipliers":{}}]],
+      },
+      force_eval_error = "ERR simulated script failure",
+    })
+
+    local env = setup_kong_env({
+      shared = {
+        jwt_claims = {
+          client_id = "client-1",
+        },
+      },
+    })
+
+    local result = handler:access({
+      redis_host = "127.0.0.1",
+      redis_env = "prod",
+      usage_grace_days = 7,
+      redis_now_epoch = now_epoch,
+      failure_strategy = "fail_closed",
+      failure_deny_status = 503,
+      redis_client_factory = function()
+        return redis
+      end,
+    })
+
+    assert.are.equal(1, #env.exits)
+    assert.are.equal(503, env.exits[1].status)
+    assert.are.equal(503, result.status)
+    assert.is_truthy(env.exits[1].body.reason:find("atomic_charge_failed_fail_closed", 1, true))
+    assert.are.equal("deny", kong.ctx.shared.cost_quota_ctx.decision)
+  end)
+
+  it("opens circuit breaker after threshold and skips redis connection", function()
+    local now_epoch = 1772107200 -- 2026-02-26 12:00:00 UTC
+    local circuit_dict = new_fake_shared_dict(function()
+      return now_epoch
+    end)
+    local connect_calls = 0
+
+    setup_kong_env({
+      shared = {
+        jwt_claims = {
+          client_id = "client-circuit",
+        },
+      },
+      shared_dicts = {
+        kong_cost_quota_circuit = circuit_dict,
+      },
+    })
+
+    local conf = {
+      redis_host = "127.0.0.1",
+      redis_env = "prod",
+      redis_now_epoch = now_epoch,
+      circuit_breaker_enabled = true,
+      circuit_failure_window_sec = 30,
+      circuit_min_requests = 1,
+      circuit_failure_threshold = 1.0,
+      circuit_open_sec = 60,
+      redis_circuit_shm = "kong_cost_quota_circuit",
+      redis_client_factory = function()
+        connect_calls = connect_calls + 1
+        return nil, "connection refused"
+      end,
+    }
+
+    handler:access(conf)
+    assert.are.equal(1, connect_calls)
+    assert.is_truthy(kong.ctx.shared.cost_quota_ctx.reason:find("redis_connect_failed_fail_open", 1, true))
+
+    handler:access(conf)
+    assert.are.equal(1, connect_calls)
+    assert.is_truthy(kong.ctx.shared.cost_quota_ctx.reason:find("redis_circuit_open_fail_open", 1, true))
+    assert.is_true(kong.ctx.shared.cost_quota_ctx.redis_circuit_open)
   end)
 
   it("uses cache_l1 source after the first redis policy fetch", function()

@@ -156,6 +156,7 @@ describe("redis_store", function()
 
   after_each(function()
     _G.ngx = nil
+    package.loaded["resty.redis"] = nil
   end)
 
   it("builds policy and usage keys with required format", function()
@@ -399,5 +400,45 @@ describe("redis_store", function()
     assert.is_nil(fourth_err)
     assert.are.equal("v2", fourth_policy.version)
     assert.are.equal("cache_l1", fourth_meta.policy_source)
+  end)
+
+  it("applies redis timeout budget between 5ms and 20ms", function()
+    local captured_timeout = nil
+    package.loaded["resty.redis"] = {
+      new = function()
+        return {
+          set_timeout = function(_, timeout)
+            captured_timeout = timeout
+          end,
+          connect = function()
+            return true
+          end,
+          set_keepalive = function()
+            return true
+          end,
+        }
+      end,
+    }
+
+    local client_low, low_err = redis_store.open_client({
+      redis_host = "127.0.0.1",
+      redis_port = 6379,
+      redis_timeout_ms = 1,
+    })
+    assert.is_nil(low_err)
+    assert.is_table(client_low)
+    assert.are.equal(5, captured_timeout)
+    redis_store.close_client(client_low, false)
+
+    captured_timeout = nil
+    local client_high, high_err = redis_store.open_client({
+      redis_host = "127.0.0.1",
+      redis_port = 6379,
+      redis_timeout_ms = 200,
+    })
+    assert.is_nil(high_err)
+    assert.is_table(client_high)
+    assert.are.equal(20, captured_timeout)
+    redis_store.close_client(client_high, false)
   end)
 end)

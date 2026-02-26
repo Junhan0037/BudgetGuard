@@ -99,7 +99,23 @@ return {
               type = "integer",
               required = false,
               default = 20,
-              between = { 1, 60000 },
+              between = { 5, 20 },
+            },
+          },
+          {
+            failure_strategy = {
+              type = "string",
+              required = false,
+              default = "fail_open",
+              one_of = { "fail_open", "fail_closed" },
+            },
+          },
+          {
+            failure_deny_status = {
+              type = "integer",
+              required = false,
+              default = 503,
+              one_of = { 429, 503 },
             },
           },
           {
@@ -182,6 +198,52 @@ return {
               required = false,
               default = 5,
               between = { 1, 30 },
+            },
+          },
+          {
+            circuit_breaker_enabled = {
+              type = "boolean",
+              required = false,
+              default = true,
+            },
+          },
+          {
+            circuit_failure_window_sec = {
+              type = "integer",
+              required = false,
+              default = 30,
+              between = { 5, 300 },
+            },
+          },
+          {
+            circuit_min_requests = {
+              type = "integer",
+              required = false,
+              default = 20,
+              between = { 1, 100000 },
+            },
+          },
+          {
+            circuit_failure_threshold = {
+              type = "number",
+              required = false,
+              default = 0.5,
+              between = { 0, 1 },
+            },
+          },
+          {
+            circuit_open_sec = {
+              type = "integer",
+              required = false,
+              default = 15,
+              between = { 1, 300 },
+            },
+          },
+          {
+            redis_circuit_shm = {
+              type = "string",
+              required = false,
+              default = "kong_cost_quota_circuit",
             },
           },
         },
