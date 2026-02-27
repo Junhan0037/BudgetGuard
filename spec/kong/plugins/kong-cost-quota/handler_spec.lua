@@ -303,6 +303,169 @@ describe("handler", function()
     assert.is_nil(env.response_headers["Retry-After"])
   end)
 
+  it("allows request in shadow mode even when budget is exceeded", function()
+    local env = setup_kong_env({
+      shared = {
+        jwt_claims = {
+          client_id = "shadow-client",
+        },
+      },
+    })
+
+    local result = handler:access({
+      rollout_mode = "shadow",
+      policy = build_base_policy({
+        default = {
+          base_weight = 3,
+          plan_multiplier = 1.0,
+          time_multiplier = 1.0,
+          custom_multiplier = 1.0,
+          budget = 2,
+        },
+      }),
+    })
+
+    assert.are.equal(0, #env.exits)
+    assert.is_nil(result)
+    local runtime_ctx = kong.ctx.shared.cost_quota_ctx
+    assert.are.equal("allow", runtime_ctx.decision)
+    assert.are.equal("deny", runtime_ctx.original_decision)
+    assert.are.equal("shadow", runtime_ctx.rollout_mode)
+    assert.is_false(runtime_ctx.rollout_enforced)
+    assert.are.equal("shadow_allow", runtime_ctx.rollout_effective_action)
+    assert.are.equal("budget_exceeded", runtime_ctx.reason)
+  end)
+
+  it("enforces only target route in partial rollout mode", function()
+    local target_env = setup_kong_env({
+      shared = {
+        jwt_claims = {
+          client_id = "partial-client",
+        },
+      },
+      route = { id = "route-1" },
+    })
+
+    local target_result = handler:access({
+      rollout_mode = "partial",
+      partial_enforce_route_ids = { "route-1" },
+      policy = build_base_policy({
+        default = {
+          base_weight = 4,
+          plan_multiplier = 1.0,
+          time_multiplier = 1.0,
+          custom_multiplier = 1.0,
+          budget = 2,
+        },
+      }),
+    })
+
+    assert.are.equal(1, #target_env.exits)
+    assert.are.equal(429, target_env.exits[1].status)
+    assert.are.equal(429, target_result.status)
+    assert.is_true(kong.ctx.shared.cost_quota_ctx.rollout_enforced)
+
+    teardown_kong_env()
+
+    local nontarget_env = setup_kong_env({
+      shared = {
+        jwt_claims = {
+          client_id = "partial-client",
+        },
+      },
+      route = { id = "route-2" },
+    })
+
+    local nontarget_result = handler:access({
+      rollout_mode = "partial",
+      partial_enforce_route_ids = { "route-1" },
+      policy = build_base_policy({
+        default = {
+          base_weight = 4,
+          plan_multiplier = 1.0,
+          time_multiplier = 1.0,
+          custom_multiplier = 1.0,
+          budget = 2,
+        },
+      }),
+    })
+
+    assert.are.equal(0, #nontarget_env.exits)
+    assert.is_nil(nontarget_result)
+    local runtime_ctx = kong.ctx.shared.cost_quota_ctx
+    assert.are.equal("allow", runtime_ctx.decision)
+    assert.is_false(runtime_ctx.rollout_enforced)
+    assert.are.equal("shadow_allow", runtime_ctx.rollout_effective_action)
+  end)
+
+  it("tightens units for emergency target client", function()
+    local env = setup_kong_env({
+      shared = {
+        jwt_claims = {
+          client_id = "emergency-client",
+        },
+      },
+    })
+
+    local result = handler:access({
+      emergency_target_client_ids = { "emergency-client" },
+      emergency_action = "tighten",
+      emergency_multiplier = 2,
+      policy = build_base_policy({
+        default = {
+          base_weight = 2,
+          plan_multiplier = 1.0,
+          time_multiplier = 1.0,
+          custom_multiplier = 1.0,
+          budget = 2,
+        },
+      }),
+    })
+
+    assert.are.equal(1, #env.exits)
+    assert.are.equal(429, env.exits[1].status)
+    assert.are.equal(429, result.status)
+    local runtime_ctx = kong.ctx.shared.cost_quota_ctx
+    assert.are.equal(4, runtime_ctx.units)
+    assert.are.equal(2, runtime_ctx.units_before_emergency)
+    assert.is_true(runtime_ctx.emergency_applied)
+    assert.are.equal("tighten", runtime_ctx.emergency_action)
+  end)
+
+  it("relaxes units for emergency target client", function()
+    local env = setup_kong_env({
+      shared = {
+        jwt_claims = {
+          client_id = "relax-client",
+        },
+      },
+    })
+
+    local result = handler:access({
+      emergency_target_client_ids = { "relax-client" },
+      emergency_action = "relax",
+      emergency_multiplier = 0.25,
+      policy = build_base_policy({
+        default = {
+          base_weight = 4,
+          plan_multiplier = 1.0,
+          time_multiplier = 1.0,
+          custom_multiplier = 1.0,
+          budget = 2,
+        },
+      }),
+    })
+
+    assert.are.equal(0, #env.exits)
+    assert.is_nil(result)
+    local runtime_ctx = kong.ctx.shared.cost_quota_ctx
+    assert.are.equal("allow", runtime_ctx.decision)
+    assert.are.equal(1, runtime_ctx.units)
+    assert.are.equal(4, runtime_ctx.units_before_emergency)
+    assert.is_true(runtime_ctx.emergency_applied)
+    assert.are.equal("relax", runtime_ctx.emergency_action)
+  end)
+
   it("uses policy deny status code when deny response is returned", function()
     local env = setup_kong_env({
       shared = {
@@ -357,6 +520,9 @@ describe("handler", function()
     assert.is_truthy(string.find(audit_log, "policy_version", 1, true))
     assert.is_truthy(string.find(audit_log, "decision", 1, true))
     assert.is_truthy(string.find(audit_log, "reason", 1, true))
+    assert.is_truthy(string.find(audit_log, "rollout_mode", 1, true))
+    assert.is_truthy(string.find(audit_log, "rollout_enforced", 1, true))
+    assert.is_truthy(string.find(audit_log, "emergency_applied", 1, true))
   end)
 
   it("skips audit log when audit_log_enabled is false", function()

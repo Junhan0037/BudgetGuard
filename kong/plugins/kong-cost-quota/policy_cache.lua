@@ -179,6 +179,18 @@ function M.cache_enabled(conf)
 end
 
 function M.resolve_policy_ttl(conf)
+  -- 요청 단위 긴급 토글이 활성화되면 캐시 TTL을 단축해 정책 반영 속도를 높인다.
+  local forced_ttl = to_integer(type(conf) == "table" and conf.__policy_cache_force_ttl_sec or nil, -1)
+  if forced_ttl >= 0 then
+    if forced_ttl < 5 then
+      forced_ttl = 5
+    end
+    if forced_ttl > 10 then
+      forced_ttl = 10
+    end
+    return forced_ttl
+  end
+
   local emergency_mode = type(conf) == "table" and conf.emergency_mode == true
   if emergency_mode then
     local ttl = to_integer(conf.policy_cache_ttl_emergency_sec, 5)

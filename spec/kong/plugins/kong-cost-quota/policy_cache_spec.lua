@@ -149,4 +149,31 @@ describe("policy_cache", function()
     local need_probe_3 = policy_cache.should_probe_version(conf, key)
     assert.is_true(need_probe_3)
   end)
+
+  it("uses forced short ttl when request-level emergency cache ttl is set", function()
+    local conf = {
+      policy_cache_enabled = true,
+      policy_cache_ttl_sec = 60,
+      __policy_cache_force_ttl_sec = 5,
+      policy_cache_shm = "kong_cost_quota_cache",
+      policy_cache_now_epoch = now_value,
+    }
+    local key = "policy:prod:client:client-emergency"
+
+    local ok = policy_cache.set_policy(conf, key, {
+      raw_policy = [[{"version":"v-emergency"}]],
+      policy_version = "v-emergency",
+    })
+    assert.is_true(ok)
+
+    local warm_entry, warm_source = policy_cache.get_policy(conf, key)
+    assert.is_table(warm_entry)
+    assert.are.equal("cache_l1", warm_source)
+
+    now_value = now_value + 6
+    conf.policy_cache_now_epoch = now_value
+    local expired_entry, expired_source = policy_cache.get_policy(conf, key)
+    assert.is_nil(expired_entry)
+    assert.is_nil(expired_source)
+  end)
 end)

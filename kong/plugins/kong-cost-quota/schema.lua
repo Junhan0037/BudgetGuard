@@ -59,6 +59,78 @@ return {
             },
           },
           {
+            rollout_mode = {
+              type = "string",
+              required = false,
+              default = "enforce",
+              one_of = { "shadow", "partial", "enforce" },
+            },
+          },
+          {
+            partial_enforce_route_ids = {
+              type = "array",
+              required = false,
+              default = {},
+              elements = {
+                type = "string",
+              },
+            },
+          },
+          {
+            partial_enforce_service_names = {
+              type = "array",
+              required = false,
+              default = {},
+              elements = {
+                type = "string",
+              },
+            },
+          },
+          {
+            partial_enforce_client_ids = {
+              type = "array",
+              required = false,
+              default = {},
+              elements = {
+                type = "string",
+              },
+            },
+          },
+          {
+            emergency_target_client_ids = {
+              type = "array",
+              required = false,
+              default = {},
+              elements = {
+                type = "string",
+              },
+            },
+          },
+          {
+            emergency_action = {
+              type = "string",
+              required = false,
+              default = "none",
+              one_of = { "none", "tighten", "relax" },
+            },
+          },
+          {
+            emergency_multiplier = {
+              type = "number",
+              required = false,
+              default = 1.0,
+              between = { 0, math.huge },
+            },
+          },
+          {
+            emergency_cache_ttl_sec = {
+              type = "integer",
+              required = false,
+              default = 5,
+              between = { 5, 10 },
+            },
+          },
+          {
             audit_log_enabled = {
               type = "boolean",
               required = false,

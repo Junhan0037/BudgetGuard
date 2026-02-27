@@ -472,6 +472,34 @@ describe("handler redis path", function()
     assert.are.equal("deny", kong.ctx.shared.cost_quota_ctx.decision)
   end)
 
+  it("does not block fail-closed redis error in shadow rollout mode", function()
+    local env = setup_kong_env({
+      shared = {
+        jwt_claims = {
+          client_id = "client-1",
+        },
+      },
+    })
+
+    local result = handler:access({
+      rollout_mode = "shadow",
+      redis_host = "127.0.0.1",
+      redis_env = "prod",
+      failure_strategy = "fail_closed",
+      failure_deny_status = 503,
+      redis_client_factory = function()
+        return nil, "timeout"
+      end,
+    })
+
+    assert.are.equal(0, #env.exits)
+    assert.is_nil(result)
+    local runtime_ctx = kong.ctx.shared.cost_quota_ctx
+    assert.are.equal("allow", runtime_ctx.decision)
+    assert.are.equal("shadow_allow", runtime_ctx.rollout_effective_action)
+    assert.are.equal("deny", runtime_ctx.original_decision)
+  end)
+
   it("keeps fail-open default when redis connection fails", function()
     local env = setup_kong_env({
       shared = {
@@ -622,5 +650,60 @@ describe("handler redis path", function()
     assert.are.equal("cache", env.response_headers["X-Policy-Source"])
     local requests_metric_log = find_log_with_keywords(env.logs, "cost_quota.requests", "cache")
     assert.is_truthy(requests_metric_log)
+  end)
+
+  it("shortens cache ttl for emergency target client and refreshes policy quickly", function()
+    local now_epoch = 1772107200 -- 2026-02-26 12:00:00 UTC
+    local cache_dict = new_fake_shared_dict(function()
+      return now_epoch
+    end)
+    local redis = new_fake_redis({
+      store = {
+        ["policy:prod:client:client-emergency"] = [[{"version":"cache-v1","deny_status_code":429,"default":{"base_weight":1,"plan_multiplier":1,"time_multiplier":1,"custom_multiplier":1,"budget":100},"rules":{},"plan_multipliers":{}}]],
+      },
+    })
+
+    setup_kong_env({
+      now_epoch = now_epoch,
+      shared = {
+        jwt_claims = {
+          client_id = "client-emergency",
+        },
+      },
+      shared_dicts = {
+        kong_cost_quota_cache = cache_dict,
+      },
+    })
+
+    local conf = {
+      redis_host = "127.0.0.1",
+      redis_env = "prod",
+      redis_now_epoch = now_epoch,
+      redis_client_factory = function()
+        return redis
+      end,
+      policy_cache_enabled = true,
+      policy_cache_ttl_sec = 60,
+      policy_cache_shm = "kong_cost_quota_cache",
+      policy_cache_version_probe_sec = 30,
+      policy_cache_now_epoch = now_epoch,
+      emergency_target_client_ids = { "client-emergency" },
+      emergency_action = "tighten",
+      emergency_multiplier = 1.0,
+      emergency_cache_ttl_sec = 5,
+    }
+
+    handler:access(conf)
+    assert.are.equal("redis", kong.ctx.shared.cost_quota_ctx.policy_source)
+
+    handler:access(conf)
+    assert.are.equal("cache_l1", kong.ctx.shared.cost_quota_ctx.policy_source)
+
+    now_epoch = now_epoch + 6
+    conf.redis_now_epoch = now_epoch
+    conf.policy_cache_now_epoch = now_epoch
+
+    handler:access(conf)
+    assert.are.equal("redis", kong.ctx.shared.cost_quota_ctx.policy_source)
   end)
 end)

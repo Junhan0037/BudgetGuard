@@ -366,6 +366,130 @@ local function extract_identity(conf)
   return identity, source_map
 end
 
+local function contains_string(list, value)
+  if type(list) ~= "table" or not is_non_empty_string(value) then
+    return false
+  end
+
+  for _, item in ipairs(list) do
+    if item == value then
+      return true
+    end
+  end
+
+  return false
+end
+
+local function resolve_rollout_mode(conf)
+  local mode = type(conf) == "table" and conf.rollout_mode or nil
+  if mode == "shadow" or mode == "partial" or mode == "enforce" then
+    return mode
+  end
+  return "enforce"
+end
+
+local function is_partial_target(conf, route_id, service_name, identity)
+  local client_id = type(identity) == "table" and identity.client_id or nil
+  if contains_string(conf and conf.partial_enforce_route_ids, route_id) then
+    return true
+  end
+  if contains_string(conf and conf.partial_enforce_service_names, service_name) then
+    return true
+  end
+  if contains_string(conf and conf.partial_enforce_client_ids, client_id) then
+    return true
+  end
+  return false
+end
+
+local function should_enforce(conf, rollout_mode, route_id, service_name, identity)
+  local mode = rollout_mode or resolve_rollout_mode(conf)
+  if mode == "shadow" then
+    return false
+  end
+  if mode == "partial" then
+    return is_partial_target(conf, route_id, service_name, identity)
+  end
+  return true
+end
+
+local function resolve_emergency_action(conf)
+  local action = type(conf) == "table" and conf.emergency_action or nil
+  if action == "tighten" or action == "relax" then
+    return action
+  end
+  return "none"
+end
+
+local function resolve_emergency_multiplier(conf, action)
+  local multiplier = tonumber(type(conf) == "table" and conf.emergency_multiplier or nil) or 1.0
+  if multiplier < 0 then
+    multiplier = 0
+  end
+
+  -- 강화/완화 의미가 뒤집히지 않도록 배수 하한/상한을 보정한다.
+  if action == "tighten" and multiplier < 1 then
+    multiplier = 1
+  elseif action == "relax" and multiplier > 1 then
+    multiplier = 1
+  end
+
+  return multiplier
+end
+
+local function is_emergency_target_client(conf, identity)
+  local client_id = type(identity) == "table" and identity.client_id or nil
+  return contains_string(conf and conf.emergency_target_client_ids, client_id), client_id
+end
+
+local function resolve_emergency_cache_ttl(conf)
+  local ttl = tonumber(type(conf) == "table" and conf.emergency_cache_ttl_sec or nil) or 5
+  ttl = math.floor(ttl)
+  if ttl < 5 then
+    ttl = 5
+  end
+  if ttl > 10 then
+    ttl = 10
+  end
+  return ttl
+end
+
+local function build_request_conf_for_emergency(conf, emergency_target)
+  if not emergency_target or type(conf) ~= "table" then
+    return conf
+  end
+
+  local copied = {}
+  for key, value in pairs(conf) do
+    copied[key] = value
+  end
+  copied.__policy_cache_force_ttl_sec = resolve_emergency_cache_ttl(conf)
+  return copied
+end
+
+local function apply_rollout_decision(raw_decision, rollout_enforced)
+  if raw_decision == "deny" and not rollout_enforced then
+    return "allow", "shadow_allow", "deny"
+  end
+
+  if raw_decision == "deny" then
+    return "deny", "deny", "deny"
+  end
+
+  return "allow", "allow", raw_decision or "allow"
+end
+
+local function apply_emergency_units(units, conf, emergency_target, emergency_action)
+  local numeric_units = tonumber(units) or 0
+  if not emergency_target or emergency_action == "none" then
+    return numeric_units, false, resolve_emergency_multiplier(conf, emergency_action), numeric_units
+  end
+
+  local multiplier = resolve_emergency_multiplier(conf, emergency_action)
+  local adjusted_units = math.ceil(math.max(numeric_units * multiplier, 0))
+  return adjusted_units, true, multiplier, numeric_units
+end
+
 local function resolve_budget(rule, policy)
   if type(rule) == "table" and type(rule.budget) == "number" then
     return rule.budget
@@ -407,6 +531,7 @@ local function build_runtime_ctx(params)
     decision = params.decision or "allow",
     reason = params.reason or "unknown",
     route_id = params.route_id,
+    service_name = params.service_name,
     remaining = remaining,
     policy_version = params.policy_version,
     policy_source = params.policy_source,
@@ -432,6 +557,15 @@ local function build_runtime_ctx(params)
     failure_source = params.failure_source,
     failure_deny_status = params.failure_deny_status,
     redis_circuit_open = params.redis_circuit_open,
+    rollout_mode = params.rollout_mode,
+    rollout_enforced = params.rollout_enforced,
+    rollout_effective_action = params.rollout_effective_action,
+    original_decision = params.original_decision,
+    emergency_applied = params.emergency_applied or false,
+    emergency_action = params.emergency_action,
+    emergency_multiplier = params.emergency_multiplier,
+    emergency_target_client_id = params.emergency_target_client_id,
+    units_before_emergency = params.units_before_emergency,
   }
 end
 
@@ -499,7 +633,11 @@ end
 local function apply_failure_strategy(conf, params)
   local strategy = failure_control.resolve_failure_strategy(conf)
   local deny_status = failure_control.resolve_failure_deny_status(conf)
-  local decision_value = strategy == "fail_closed" and "deny" or "allow"
+  local raw_decision = strategy == "fail_closed" and "deny" or "allow"
+  local final_decision, effective_action, original_decision = apply_rollout_decision(
+    raw_decision,
+    params.rollout_enforced ~= false
+  )
   local reason_prefix = params.reason_prefix or "redis_failure"
   local reason = reason_prefix .. "_" .. strategy
 
@@ -518,9 +656,10 @@ local function apply_failure_strategy(conf, params)
     identity_source = params.identity_source,
     units = params.units or 0,
     current_usage = params.current_usage or 0,
-    decision = decision_value,
+    decision = final_decision,
     reason = reason,
     route_id = params.route_id,
+    service_name = params.service_name,
     policy_version = params.policy_version,
     policy_source = params.policy_source or "redis_failure",
     policy_key = params.policy_key,
@@ -539,13 +678,22 @@ local function apply_failure_strategy(conf, params)
     failure_source = params.failure_source,
     failure_deny_status = deny_status,
     redis_circuit_open = params.redis_circuit_open or false,
+    rollout_mode = params.rollout_mode,
+    rollout_enforced = params.rollout_enforced,
+    rollout_effective_action = effective_action,
+    original_decision = original_decision,
+    emergency_applied = params.emergency_applied or false,
+    emergency_action = params.emergency_action,
+    emergency_multiplier = params.emergency_multiplier,
+    emergency_target_client_id = params.emergency_target_client_id,
+    units_before_emergency = params.units_before_emergency,
     meta = params.meta or {
       budget = nil,
       projected_usage = nil,
     },
   }))
 
-  if decision_value == "deny" then
+  if raw_decision == "deny" and params.rollout_enforced ~= false then
     return exit_with_status(deny_status, {
       message = "redis is unavailable",
       reason = reason,
@@ -560,77 +708,125 @@ end
 function plugin:access(conf)
   local identity, identity_source = extract_identity(conf)
   local route_id = get_route_id()
+  local service_name = get_service_name()
+  local rollout_mode = resolve_rollout_mode(conf)
+  local rollout_enforced = should_enforce(conf, rollout_mode, route_id, service_name, identity)
+  local emergency_target, emergency_target_client_id = is_emergency_target_client(conf, identity)
+  local emergency_action = resolve_emergency_action(conf)
+  local request_conf = build_request_conf_for_emergency(conf, emergency_target)
+  local emergency_multiplier_default = resolve_emergency_multiplier(request_conf, emergency_action)
+
   local redis_client = nil
   local redis_is_factory_client = false
   local redis_error = nil
-  local redis_requested = should_use_redis(conf)
+  local redis_requested = should_use_redis(request_conf)
   local redis_had_failure = false
+
+  local function commit_access_ctx(params)
+    params.rollout_mode = rollout_mode
+    params.rollout_enforced = rollout_enforced
+    params.service_name = service_name
+    params.emergency_applied = params.emergency_applied or false
+    params.emergency_action = params.emergency_action or emergency_action
+    params.emergency_multiplier = params.emergency_multiplier or emergency_multiplier_default
+    params.emergency_target_client_id = emergency_target_client_id
+    params.units_before_emergency = params.units_before_emergency or params.units
+    if params.rollout_effective_action == nil then
+      params.rollout_effective_action = params.decision == "deny" and "deny" or "allow"
+    end
+    if params.original_decision == nil then
+      params.original_decision = params.decision
+    end
+    commit_runtime_ctx(build_runtime_ctx(params))
+  end
 
   local ok_identity = policy_model.validate_identity(identity)
   if not ok_identity then
-    commit_runtime_ctx(build_runtime_ctx({
+    local final_decision, effective_action, original_decision = apply_rollout_decision("deny", rollout_enforced)
+    commit_access_ctx({
       identity = identity,
       identity_source = identity_source,
       units = 0,
-      decision = "deny",
+      decision = final_decision,
       reason = "identity_missing",
       route_id = route_id,
       policy_version = nil,
+      rollout_effective_action = effective_action,
+      original_decision = original_decision,
       meta = {
         budget = nil,
         projected_usage = nil,
       },
-    }))
-
-    return exit_with_status(429, {
-      message = "required identity is missing",
-      reason = "identity_missing",
     })
+
+    if final_decision == "deny" then
+      return exit_with_status(429, {
+        message = "required identity is missing",
+        reason = "identity_missing",
+      })
+    end
+    return
   end
 
   if redis_requested then
-    local circuit_open, circuit_meta = failure_control.is_circuit_open(conf)
+    local circuit_open, circuit_meta = failure_control.is_circuit_open(request_conf)
     if circuit_open then
       local response = nil
-      response = select(1, apply_failure_strategy(conf, {
+      response = select(1, apply_failure_strategy(request_conf, {
         identity = identity,
         identity_source = identity_source,
         route_id = route_id,
+        service_name = service_name,
         reason_prefix = "redis_circuit_open",
         failure_source = circuit_meta and circuit_meta.source or "redis_circuit_open",
         redis_error = "redis circuit breaker is open",
         policy_source = "circuit_open",
         redis_circuit_open = true,
+        rollout_mode = rollout_mode,
+        rollout_enforced = rollout_enforced,
+        emergency_applied = false,
+        emergency_action = emergency_action,
+        emergency_multiplier = emergency_multiplier_default,
+        emergency_target_client_id = emergency_target_client_id,
+        units_before_emergency = 0,
       }))
       return response
     end
 
-    redis_client, redis_error, redis_is_factory_client = redis_store.open_client(conf)
+    redis_client, redis_error, redis_is_factory_client = redis_store.open_client(request_conf)
     if not redis_client then
       redis_had_failure = true
-      failure_control.record_redis_result(conf, false)
+      failure_control.record_redis_result(request_conf, false)
       local response = nil
-      response = select(1, apply_failure_strategy(conf, {
+      response = select(1, apply_failure_strategy(request_conf, {
         identity = identity,
         identity_source = identity_source,
         route_id = route_id,
+        service_name = service_name,
         reason_prefix = "redis_connect_failed",
         failure_source = "redis_connect",
         redis_error = redis_error,
         policy_source = "redis_connect_error",
+        rollout_mode = rollout_mode,
+        rollout_enforced = rollout_enforced,
+        emergency_applied = false,
+        emergency_action = emergency_action,
+        emergency_multiplier = emergency_multiplier_default,
+        emergency_target_client_id = emergency_target_client_id,
+        units_before_emergency = 0,
       }))
       return response
     end
   end
 
-  local raw_policy, policy_meta = resolve_policy(conf, identity, redis_client)
+  local raw_policy, policy_meta = resolve_policy(request_conf, identity, redis_client)
   if policy_meta and policy_meta.redis_error and not redis_error then
     redis_error = policy_meta.redis_error
   end
 
   if redis_requested and is_non_empty_string(redis_error) then
     redis_had_failure = true
-    failure_control.record_redis_result(conf, false)
+    failure_control.record_redis_result(request_conf, false)
   end
 
   local policy_version = resolve_policy_version(raw_policy)
@@ -638,10 +834,11 @@ function plugin:access(conf)
     if redis_requested and is_non_empty_string(redis_error) then
       close_redis_client(redis_client, redis_is_factory_client)
       local response = nil
-      response = select(1, apply_failure_strategy(conf, {
+      response = select(1, apply_failure_strategy(request_conf, {
         identity = identity,
         identity_source = identity_source,
         route_id = route_id,
+        service_name = service_name,
         reason_prefix = "redis_policy_fetch_failed",
         failure_source = "redis_policy_fetch",
         redis_error = redis_error,
@@ -649,18 +846,26 @@ function plugin:access(conf)
         policy_key = policy_meta and policy_meta.policy_key or nil,
         usage_scope = policy_meta and policy_meta.policy_scope or nil,
         usage_id = policy_meta and policy_meta.policy_id or nil,
+        rollout_mode = rollout_mode,
+        rollout_enforced = rollout_enforced,
+        emergency_applied = false,
+        emergency_action = emergency_action,
+        emergency_multiplier = emergency_multiplier_default,
+        emergency_target_client_id = emergency_target_client_id,
+        units_before_emergency = 0,
       }))
       return response
     end
 
-    local deny_when_missing = conf and conf.redis_policy_required == true
-    local decision_result = deny_when_missing and "deny" or "allow"
+    local deny_when_missing = request_conf and request_conf.redis_policy_required == true
+    local raw_decision = deny_when_missing and "deny" or "allow"
+    local final_decision, effective_action, original_decision = apply_rollout_decision(raw_decision, rollout_enforced)
 
-    commit_runtime_ctx(build_runtime_ctx({
+    commit_access_ctx({
       identity = identity,
       identity_source = identity_source,
       units = 0,
-      decision = decision_result,
+      decision = final_decision,
       reason = "policy_missing",
       route_id = route_id,
       policy_version = nil,
@@ -669,30 +874,32 @@ function plugin:access(conf)
       usage_scope = policy_meta and policy_meta.policy_scope or nil,
       usage_id = policy_meta and policy_meta.policy_id or nil,
       redis_error = redis_error,
+      rollout_effective_action = effective_action,
+      original_decision = original_decision,
       meta = {
         budget = nil,
         projected_usage = nil,
       },
-    }))
+    })
 
     close_redis_client(redis_client, redis_is_factory_client)
 
-    if deny_when_missing then
+    if redis_requested and not redis_had_failure then
+      failure_control.record_redis_result(request_conf, true)
+    end
+
+    if deny_when_missing and final_decision == "deny" then
       return exit_with_status(429, {
         message = "policy is missing",
         reason = "policy_missing",
       })
-    end
-
-    if redis_requested and not redis_had_failure then
-      failure_control.record_redis_result(conf, true)
     end
     return
   end
 
   local normalized_policy, normalize_err = policy_model.normalize_policy(raw_policy)
   if not normalized_policy or normalize_err then
-    commit_runtime_ctx(build_runtime_ctx({
+    commit_access_ctx({
       identity = identity,
       identity_source = identity_source,
       units = 0,
@@ -709,18 +916,18 @@ function plugin:access(conf)
         budget = nil,
         projected_usage = nil,
       },
-    }))
+    })
 
     close_redis_client(redis_client, redis_is_factory_client)
     if redis_requested and not redis_had_failure then
-      failure_control.record_redis_result(conf, true)
+      failure_control.record_redis_result(request_conf, true)
     end
     return
   end
 
   local req_ctx = {
     route_id = route_id,
-    service = get_service_name(),
+    service = service_name,
     path = get_path(),
     method = get_method(),
   }
@@ -732,7 +939,7 @@ function plugin:access(conf)
   }, normalized_policy, identity)
 
   if units_err then
-    commit_runtime_ctx(build_runtime_ctx({
+    commit_access_ctx({
       identity = identity,
       identity_source = identity_source,
       units = 0,
@@ -749,16 +956,24 @@ function plugin:access(conf)
         budget = nil,
         projected_usage = nil,
       },
-    }))
+    })
 
     close_redis_client(redis_client, redis_is_factory_client)
     if redis_requested and not redis_had_failure then
-      failure_control.record_redis_result(conf, true)
+      failure_control.record_redis_result(request_conf, true)
     end
     return
   end
 
-  local current_epoch = redis_store.current_epoch(conf)
+  local adjusted_units, emergency_applied, emergency_multiplier, units_before_emergency = apply_emergency_units(
+    units,
+    request_conf,
+    emergency_target,
+    emergency_action
+  )
+  units = adjusted_units
+
+  local current_epoch = redis_store.current_epoch(request_conf)
   local usage_scope = policy_meta and policy_meta.policy_scope or nil
   local usage_id = policy_meta and policy_meta.policy_id or nil
   local usage_keys = {}
@@ -774,15 +989,14 @@ function plugin:access(conf)
   local month_after = nil
   local day_after = nil
   local exceeded_by = nil
-  local atomic_enabled = not (conf and conf.redis_atomic_enabled == false)
-  local deny_status = decision.resolve_deny_status(conf, normalized_policy)
-
+  local atomic_enabled = not (request_conf and request_conf.redis_atomic_enabled == false)
+  local deny_status = decision.resolve_deny_status(request_conf, normalized_policy)
   local budget = resolve_budget(matched_rule, normalized_policy)
 
   if redis_client and atomic_enabled and is_non_empty_string(usage_scope) and is_non_empty_string(usage_id) then
     local atomic_result, atomic_meta, atomic_err = redis_store.atomic_charge_usages(
       redis_client,
-      conf,
+      request_conf,
       usage_scope,
       usage_id,
       units,
@@ -794,14 +1008,15 @@ function plugin:access(conf)
       increment_error = atomic_err
       close_redis_client(redis_client, redis_is_factory_client)
       redis_had_failure = true
-      failure_control.record_redis_result(conf, false)
+      failure_control.record_redis_result(request_conf, false)
       local response = nil
-      response = select(1, apply_failure_strategy(conf, {
+      response = select(1, apply_failure_strategy(request_conf, {
         identity = identity,
         identity_source = identity_source,
         units = units,
         current_usage = 0,
         route_id = route_id,
+        service_name = service_name,
         policy_version = policy_version,
         policy_source = policy_meta and policy_meta.policy_source or "none",
         policy_key = policy_meta and policy_meta.policy_key or nil,
@@ -818,6 +1033,13 @@ function plugin:access(conf)
         atomic_error = atomic_err,
         reason_prefix = "atomic_charge_failed",
         failure_source = "redis_atomic_charge",
+        rollout_mode = rollout_mode,
+        rollout_enforced = rollout_enforced,
+        emergency_applied = emergency_applied,
+        emergency_action = emergency_action,
+        emergency_multiplier = emergency_multiplier,
+        emergency_target_client_id = emergency_target_client_id,
+        units_before_emergency = units_before_emergency,
         meta = {
           budget = budget,
           projected_usage = units,
@@ -837,9 +1059,9 @@ function plugin:access(conf)
     exceeded_by = atomic_result.exceeded_by
     current_usage = atomic_result.current_usage_before or 0
 
-    local result = atomic_result.decision
+    local raw_decision = atomic_result.decision
     local reason = atomic_result.reason
-    if result == "allow" then
+    if raw_decision == "allow" then
       usage_month = month_after
       usage_day = day_after
     else
@@ -847,12 +1069,17 @@ function plugin:access(conf)
       usage_day = day_before
     end
 
-    commit_runtime_ctx(build_runtime_ctx({
+    local final_decision, effective_action, original_decision = apply_rollout_decision(raw_decision, rollout_enforced)
+    commit_access_ctx({
       identity = identity,
       identity_source = identity_source,
       units = units,
+      units_before_emergency = units_before_emergency,
+      emergency_applied = emergency_applied,
+      emergency_action = emergency_action,
+      emergency_multiplier = emergency_multiplier,
       current_usage = current_usage,
-      decision = result,
+      decision = final_decision,
       reason = reason,
       route_id = route_id,
       policy_version = policy_version,
@@ -873,16 +1100,18 @@ function plugin:access(conf)
       month_after = month_after,
       day_after = day_after,
       exceeded_by = exceeded_by,
+      rollout_effective_action = effective_action,
+      original_decision = original_decision,
       meta = {
         budget = budget,
         projected_usage = atomic_result.projected_usage,
       },
-    }))
+    })
 
-    if result == "deny" then
+    if raw_decision == "deny" and rollout_enforced then
       close_redis_client(redis_client, redis_is_factory_client)
       if redis_requested and not redis_had_failure then
-        failure_control.record_redis_result(conf, true)
+        failure_control.record_redis_result(request_conf, true)
       end
       return exit_with_status(deny_status, {
         message = "budget exceeded",
@@ -893,18 +1122,22 @@ function plugin:access(conf)
 
     close_redis_client(redis_client, redis_is_factory_client)
     if redis_requested and not redis_had_failure then
-      failure_control.record_redis_result(conf, true)
+      failure_control.record_redis_result(request_conf, true)
     end
     return
   end
 
   -- Redis 원자 경로를 사용하지 못할 때의 호환 경로다.
-  local result, meta, decision_err = decision.make_decision(current_usage, budget, units, conf, normalized_policy)
+  local result, meta, decision_err = decision.make_decision(current_usage, budget, units, request_conf, normalized_policy)
   if decision_err then
-    commit_runtime_ctx(build_runtime_ctx({
+    commit_access_ctx({
       identity = identity,
       identity_source = identity_source,
       units = units,
+      units_before_emergency = units_before_emergency,
+      emergency_applied = emergency_applied,
+      emergency_action = emergency_action,
+      emergency_multiplier = emergency_multiplier,
       current_usage = current_usage,
       decision = "allow",
       reason = "decision_error",
@@ -924,11 +1157,11 @@ function plugin:access(conf)
         budget = budget,
         projected_usage = current_usage + units,
       },
-    }))
+    })
 
     close_redis_client(redis_client, redis_is_factory_client)
     if redis_requested and not redis_had_failure then
-      failure_control.record_redis_result(conf, true)
+      failure_control.record_redis_result(request_conf, true)
     end
     return
   end
@@ -936,7 +1169,7 @@ function plugin:access(conf)
   if result == "allow" and redis_client and is_non_empty_string(usage_scope) and is_non_empty_string(usage_id) then
     local increased, increased_meta, incr_err = redis_store.increment_usages(
       redis_client,
-      conf,
+      request_conf,
       usage_scope,
       usage_id,
       units,
@@ -946,14 +1179,15 @@ function plugin:access(conf)
       increment_error = incr_err
       close_redis_client(redis_client, redis_is_factory_client)
       redis_had_failure = true
-      failure_control.record_redis_result(conf, false)
+      failure_control.record_redis_result(request_conf, false)
       local response = nil
-      response = select(1, apply_failure_strategy(conf, {
+      response = select(1, apply_failure_strategy(request_conf, {
         identity = identity,
         identity_source = identity_source,
         units = units,
         current_usage = current_usage,
         route_id = route_id,
+        service_name = service_name,
         policy_version = policy_version,
         policy_source = policy_meta and policy_meta.policy_source or "none",
         policy_key = policy_meta and policy_meta.policy_key or nil,
@@ -969,6 +1203,13 @@ function plugin:access(conf)
         atomic = false,
         reason_prefix = "usage_increment_failed",
         failure_source = "redis_increment",
+        rollout_mode = rollout_mode,
+        rollout_enforced = rollout_enforced,
+        emergency_applied = emergency_applied,
+        emergency_action = emergency_action,
+        emergency_multiplier = emergency_multiplier,
+        emergency_target_client_id = emergency_target_client_id,
+        units_before_emergency = units_before_emergency,
         meta = {
           budget = budget,
           projected_usage = current_usage + units,
@@ -987,12 +1228,17 @@ function plugin:access(conf)
     end
   end
 
-  commit_runtime_ctx(build_runtime_ctx({
+  local final_decision, effective_action, original_decision = apply_rollout_decision(result, rollout_enforced)
+  commit_access_ctx({
     identity = identity,
     identity_source = identity_source,
     units = units,
+    units_before_emergency = units_before_emergency,
+    emergency_applied = emergency_applied,
+    emergency_action = emergency_action,
+    emergency_multiplier = emergency_multiplier,
     current_usage = current_usage,
-    decision = result,
+    decision = final_decision,
     reason = meta and meta.reason or "unknown",
     route_id = route_id,
     policy_version = policy_version,
@@ -1013,14 +1259,16 @@ function plugin:access(conf)
     month_after = month_after,
     day_after = day_after,
     exceeded_by = exceeded_by,
+    rollout_effective_action = effective_action,
+    original_decision = original_decision,
     meta = meta,
-  }))
+  })
 
-  if result == "deny" then
+  if result == "deny" and rollout_enforced then
     local fallback_deny_status = meta and meta.deny_status or 429
     close_redis_client(redis_client, redis_is_factory_client)
     if redis_requested and not redis_had_failure then
-      failure_control.record_redis_result(conf, true)
+      failure_control.record_redis_result(request_conf, true)
     end
     return exit_with_status(fallback_deny_status, {
       message = "budget exceeded",
@@ -1031,7 +1279,7 @@ function plugin:access(conf)
 
   close_redis_client(redis_client, redis_is_factory_client)
   if redis_requested and not redis_had_failure then
-    failure_control.record_redis_result(conf, true)
+    failure_control.record_redis_result(request_conf, true)
   end
 end
 
@@ -1060,6 +1308,9 @@ function plugin:log(conf)
     policy_source = runtime_ctx.policy_source,
     decision = runtime_ctx.decision,
     reason = runtime_ctx.reason,
+    rollout_mode = runtime_ctx.rollout_mode,
+    rollout_enforced = runtime_ctx.rollout_enforced,
+    emergency_applied = runtime_ctx.emergency_applied,
   }
 
   log_notice("cost_quota_audit " .. encode_json(audit_event))
