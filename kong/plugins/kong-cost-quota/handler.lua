@@ -77,6 +77,23 @@ local function set_runtime_ctx(data)
   shared.cost_quota_ctx = data
 end
 
+local function normalize_policy_source(policy_source)
+  -- 내부 소스 값을 PRD 표준(source=cache|redis|default)으로 정규화한다.
+  if policy_source == "cache_l1" or policy_source == "cache_l2" then
+    return "cache"
+  end
+
+  if policy_source == "redis" or policy_source == "redis_miss" then
+    return "redis"
+  end
+
+  if policy_source == "config" or policy_source == "none" then
+    return "default"
+  end
+
+  return "default"
+end
+
 local function encode_json(payload)
   local encoder = nil
   if has_cjson_safe and cjson_safe and cjson_safe.encode then
@@ -130,6 +147,92 @@ end
 local function emit_failure_alarm(payload)
   -- 운영 알람 연계를 위해 장애 이벤트를 구조화 로그로 남긴다.
   log_warn("cost_quota_failure " .. encode_json(payload))
+end
+
+local function set_response_header(name, value)
+  if value == nil then
+    return
+  end
+
+  if not (kong and kong.response and type(kong.response.set_header) == "function") then
+    return
+  end
+
+  kong.response.set_header(name, tostring(value))
+end
+
+local function resolve_retry_after_seconds(runtime_ctx)
+  -- 현재 단계는 day 윈도우 TTL을 Retry-After 기준으로 사용한다.
+  local ttl_seconds = runtime_ctx and runtime_ctx.ttl_seconds or nil
+  if type(ttl_seconds) ~= "table" then
+    return nil
+  end
+
+  local day_ttl = tonumber(ttl_seconds.day)
+  if not day_ttl or day_ttl <= 0 then
+    return nil
+  end
+
+  return math.floor(day_ttl)
+end
+
+local function set_observability_headers(runtime_ctx)
+  if type(runtime_ctx) ~= "table" then
+    return
+  end
+
+  local normalized_source = normalize_policy_source(runtime_ctx.policy_source)
+  set_response_header("X-Usage-Units", runtime_ctx.units or 0)
+  set_response_header("X-Remaining-Units", runtime_ctx.remaining)
+  set_response_header("X-Budget-Window", "day")
+  set_response_header("X-Policy-Version", runtime_ctx.policy_version)
+  set_response_header("X-Policy-Source", normalized_source)
+
+  -- 차단 응답에서만 재시도 가이드를 제공한다.
+  if runtime_ctx.decision == "deny" then
+    local retry_after = resolve_retry_after_seconds(runtime_ctx)
+    if retry_after then
+      set_response_header("Retry-After", retry_after)
+    end
+  end
+end
+
+local function emit_metric(name, value, tags)
+  -- 메트릭 수집기는 구조화 로그(cost_quota_metric)를 파싱해 적재한다.
+  log_notice("cost_quota_metric " .. encode_json({
+    metric = name,
+    value = value,
+    result = tags and tags.result or nil,
+    source = tags and tags.source or nil,
+  }))
+end
+
+local function emit_observability_metrics(runtime_ctx)
+  if type(runtime_ctx) ~= "table" then
+    return
+  end
+
+  local request_result = runtime_ctx.decision == "deny" and "deny" or "allow"
+  local request_source = normalize_policy_source(runtime_ctx.policy_source)
+  local cache_hit = 0
+  if runtime_ctx.policy_source == "cache_l1" or runtime_ctx.policy_source == "cache_l2" then
+    cache_hit = 1
+  end
+
+  emit_metric("cost_quota.requests", 1, {
+    result = request_result,
+    source = request_source,
+  })
+  emit_metric("cost_quota.units_charged", tonumber(runtime_ctx.units) or 0)
+  -- 현재 단계는 Redis 지연시간 측정 지표 골격만 제공하고 후속 단계에서 실측을 확장한다.
+  emit_metric("cost_quota.redis_latency_ms", tonumber(runtime_ctx.redis_latency_ms) or 0)
+  emit_metric("cost_quota.policy_cache_hit", cache_hit)
+end
+
+local function commit_runtime_ctx(runtime_ctx)
+  set_runtime_ctx(runtime_ctx)
+  set_observability_headers(runtime_ctx)
+  emit_observability_metrics(runtime_ctx)
 end
 
 local function copy_non_empty_fields(source)
@@ -410,7 +513,7 @@ local function apply_failure_strategy(conf, params)
     policy_source = params.policy_source,
   })
 
-  set_runtime_ctx(build_runtime_ctx({
+  commit_runtime_ctx(build_runtime_ctx({
     identity = params.identity,
     identity_source = params.identity_source,
     units = params.units or 0,
@@ -465,7 +568,7 @@ function plugin:access(conf)
 
   local ok_identity = policy_model.validate_identity(identity)
   if not ok_identity then
-    set_runtime_ctx(build_runtime_ctx({
+    commit_runtime_ctx(build_runtime_ctx({
       identity = identity,
       identity_source = identity_source,
       units = 0,
@@ -553,7 +656,7 @@ function plugin:access(conf)
     local deny_when_missing = conf and conf.redis_policy_required == true
     local decision_result = deny_when_missing and "deny" or "allow"
 
-    set_runtime_ctx(build_runtime_ctx({
+    commit_runtime_ctx(build_runtime_ctx({
       identity = identity,
       identity_source = identity_source,
       units = 0,
@@ -589,7 +692,7 @@ function plugin:access(conf)
 
   local normalized_policy, normalize_err = policy_model.normalize_policy(raw_policy)
   if not normalized_policy or normalize_err then
-    set_runtime_ctx(build_runtime_ctx({
+    commit_runtime_ctx(build_runtime_ctx({
       identity = identity,
       identity_source = identity_source,
       units = 0,
@@ -629,7 +732,7 @@ function plugin:access(conf)
   }, normalized_policy, identity)
 
   if units_err then
-    set_runtime_ctx(build_runtime_ctx({
+    commit_runtime_ctx(build_runtime_ctx({
       identity = identity,
       identity_source = identity_source,
       units = 0,
@@ -744,7 +847,7 @@ function plugin:access(conf)
       usage_day = day_before
     end
 
-    set_runtime_ctx(build_runtime_ctx({
+    commit_runtime_ctx(build_runtime_ctx({
       identity = identity,
       identity_source = identity_source,
       units = units,
@@ -798,7 +901,7 @@ function plugin:access(conf)
   -- Redis 원자 경로를 사용하지 못할 때의 호환 경로다.
   local result, meta, decision_err = decision.make_decision(current_usage, budget, units, conf, normalized_policy)
   if decision_err then
-    set_runtime_ctx(build_runtime_ctx({
+    commit_runtime_ctx(build_runtime_ctx({
       identity = identity,
       identity_source = identity_source,
       units = units,
@@ -884,7 +987,7 @@ function plugin:access(conf)
     end
   end
 
-  set_runtime_ctx(build_runtime_ctx({
+  commit_runtime_ctx(build_runtime_ctx({
     identity = identity,
     identity_source = identity_source,
     units = units,

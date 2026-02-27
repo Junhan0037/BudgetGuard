@@ -6,6 +6,7 @@ local function setup_kong_env(opts)
   local options = opts or {}
   local exits = {}
   local logs = {}
+  local response_headers = {}
 
   local headers = options.headers or {}
   local path = options.path or "/v1/resource"
@@ -36,6 +37,9 @@ local function setup_kong_env(opts)
       end,
     },
     response = {
+      set_header = function(name, value)
+        response_headers[name] = tostring(value)
+      end,
       exit = function(status, body)
         exits[#exits + 1] = { status = status, body = body }
         return { status = status, body = body }
@@ -64,7 +68,28 @@ local function setup_kong_env(opts)
   return {
     exits = exits,
     logs = logs,
+    response_headers = response_headers,
   }
+end
+
+local function find_log(logs, keyword)
+  -- 로그 배열에서 특정 문자열이 포함된 첫 메시지를 찾는다.
+  for _, message in ipairs(logs or {}) do
+    if string.find(message, keyword, 1, true) then
+      return message
+    end
+  end
+  return nil
+end
+
+local function find_log_with_keywords(logs, keyword1, keyword2)
+  -- 메트릭 이름/태그처럼 두 키워드가 함께 있는 로그를 찾는다.
+  for _, message in ipairs(logs or {}) do
+    if string.find(message, keyword1, 1, true) and string.find(message, keyword2, 1, true) then
+      return message
+    end
+  end
+  return nil
 end
 
 local function teardown_kong_env()
@@ -215,6 +240,33 @@ describe("handler", function()
     assert.are.equal("trusted_header", runtime_ctx.identity_source.client_id)
   end)
 
+  it("sets observability headers and emits metrics on allow request", function()
+    local env = setup_kong_env({
+      shared = {
+        jwt_claims = {
+          client_id = "header-check-client",
+        },
+      },
+    })
+
+    handler:access({
+      policy = build_base_policy(),
+    })
+
+    assert.are.equal("2", env.response_headers["X-Usage-Units"])
+    assert.are.equal("8", env.response_headers["X-Remaining-Units"])
+    assert.are.equal("day", env.response_headers["X-Budget-Window"])
+    assert.are.equal("v2026-02-26", env.response_headers["X-Policy-Version"])
+    assert.are.equal("default", env.response_headers["X-Policy-Source"])
+    assert.is_nil(env.response_headers["Retry-After"])
+
+    assert.is_truthy(find_log(env.logs, "cost_quota_metric"))
+    assert.is_truthy(find_log_with_keywords(env.logs, "cost_quota.requests", "default"))
+    assert.is_truthy(find_log(env.logs, "cost_quota.units_charged"))
+    assert.is_truthy(find_log(env.logs, "cost_quota.redis_latency_ms"))
+    assert.is_truthy(find_log(env.logs, "cost_quota.policy_cache_hit"))
+  end)
+
   it("denies when projected usage exceeds budget", function()
     local env = setup_kong_env({
       shared = {
@@ -244,6 +296,11 @@ describe("handler", function()
     local runtime_ctx = kong.ctx.shared.cost_quota_ctx
     assert.are.equal("deny", runtime_ctx.decision)
     assert.are.equal("budget_exceeded", runtime_ctx.reason)
+    assert.are.equal("3", env.response_headers["X-Usage-Units"])
+    assert.are.equal("0", env.response_headers["X-Remaining-Units"])
+    assert.are.equal("day", env.response_headers["X-Budget-Window"])
+    assert.are.equal("default", env.response_headers["X-Policy-Source"])
+    assert.is_nil(env.response_headers["Retry-After"])
   end)
 
   it("uses policy deny status code when deny response is returned", function()
@@ -290,10 +347,16 @@ describe("handler", function()
     handler:access(conf)
     handler:log(conf)
 
-    assert.are.equal(1, #env.logs)
-    assert.is_truthy(string.find(env.logs[1], "cost_quota_audit", 1, true))
-    assert.is_truthy(string.find(env.logs[1], "audit-client", 1, true))
-    assert.is_truthy(string.find(env.logs[1], "decision", 1, true))
+    local audit_log = find_log(env.logs, "cost_quota_audit")
+    assert.is_truthy(audit_log)
+    assert.is_truthy(string.find(audit_log, "audit-client", 1, true))
+    assert.is_truthy(string.find(audit_log, "audit-org", 1, true))
+    assert.is_truthy(string.find(audit_log, "route_id", 1, true))
+    assert.is_truthy(string.find(audit_log, "units", 1, true))
+    assert.is_truthy(string.find(audit_log, "remaining", 1, true))
+    assert.is_truthy(string.find(audit_log, "policy_version", 1, true))
+    assert.is_truthy(string.find(audit_log, "decision", 1, true))
+    assert.is_truthy(string.find(audit_log, "reason", 1, true))
   end)
 
   it("skips audit log when audit_log_enabled is false", function()
@@ -313,6 +376,6 @@ describe("handler", function()
     handler:access(conf)
     handler:log(conf)
 
-    assert.are.equal(0, #env.logs)
+    assert.is_nil(find_log(env.logs, "cost_quota_audit"))
   end)
 end)

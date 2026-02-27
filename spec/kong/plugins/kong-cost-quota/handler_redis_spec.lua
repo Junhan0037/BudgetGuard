@@ -60,6 +60,8 @@ end
 local function setup_kong_env(opts)
   local options = opts or {}
   local exits = {}
+  local logs = {}
+  local response_headers = {}
   local shared = options.shared or {}
   local now_value = options.now_epoch or 0
   local shared_dicts = options.shared_dicts or {}
@@ -85,6 +87,9 @@ local function setup_kong_env(opts)
       end,
     },
     response = {
+      set_header = function(name, value)
+        response_headers[name] = tostring(value)
+      end,
       exit = function(status, body)
         exits[#exits + 1] = { status = status, body = body }
         return { status = status, body = body }
@@ -100,8 +105,8 @@ local function setup_kong_env(opts)
       shared = shared,
     },
     log = {
-      notice = function()
-        return
+      notice = function(message)
+        logs[#logs + 1] = message
       end,
     },
   }
@@ -116,7 +121,29 @@ local function setup_kong_env(opts)
 
   return {
     exits = exits,
+    logs = logs,
+    response_headers = response_headers,
   }
+end
+
+local function find_log(logs, keyword)
+  -- 로그 배열에서 특정 문자열이 포함된 첫 메시지를 찾는다.
+  for _, message in ipairs(logs or {}) do
+    if string.find(message, keyword, 1, true) then
+      return message
+    end
+  end
+  return nil
+end
+
+local function find_log_with_keywords(logs, keyword1, keyword2)
+  -- 메트릭 이름/태그처럼 두 키워드가 함께 있는 로그를 찾는다.
+  for _, message in ipairs(logs or {}) do
+    if string.find(message, keyword1, 1, true) and string.find(message, keyword2, 1, true) then
+      return message
+    end
+  end
+  return nil
 end
 
 local function teardown_kong_env()
@@ -239,7 +266,7 @@ describe("handler redis path", function()
       },
     })
 
-    setup_kong_env({
+    local env = setup_kong_env({
       shared = {
         jwt_claims = {
           client_id = "client-1",
@@ -272,6 +299,10 @@ describe("handler redis path", function()
     assert.is_truthy(day_key)
     assert.are.equal("2", redis.store[month_key])
     assert.are.equal("2", redis.store[day_key])
+    assert.are.equal("redis", env.response_headers["X-Policy-Source"])
+    assert.are.equal("day", env.response_headers["X-Budget-Window"])
+    assert.is_truthy(find_log(env.logs, "cost_quota.requests"))
+    assert.is_truthy(find_log(env.logs, "cost_quota.units_charged"))
   end)
 
   it("falls back to org policy when client policy is missing", function()
@@ -373,6 +404,10 @@ describe("handler redis path", function()
     assert.are.equal("budget_exceeded", env.exits[1].body.reason)
     assert.are.equal("9", redis.store[month_key])
     assert.are.equal("1", redis.store[day_key])
+    assert.are.equal("redis", env.response_headers["X-Policy-Source"])
+    assert.are.equal("day", env.response_headers["X-Budget-Window"])
+    assert.is_not_nil(env.response_headers["Retry-After"])
+    assert.is_truthy(find_log(env.logs, "cost_quota.requests"))
   end)
 
   it("fails open when atomic script execution fails", function()
@@ -551,7 +586,7 @@ describe("handler redis path", function()
       },
     })
 
-    setup_kong_env({
+    local env = setup_kong_env({
       now_epoch = now_epoch,
       shared = {
         jwt_claims = {
@@ -580,8 +615,12 @@ describe("handler redis path", function()
 
     handler:access(conf)
     assert.are.equal("redis", kong.ctx.shared.cost_quota_ctx.policy_source)
+    assert.are.equal("redis", env.response_headers["X-Policy-Source"])
 
     handler:access(conf)
     assert.are.equal("cache_l1", kong.ctx.shared.cost_quota_ctx.policy_source)
+    assert.are.equal("cache", env.response_headers["X-Policy-Source"])
+    local requests_metric_log = find_log_with_keywords(env.logs, "cost_quota.requests", "cache")
+    assert.is_truthy(requests_metric_log)
   end)
 end)
