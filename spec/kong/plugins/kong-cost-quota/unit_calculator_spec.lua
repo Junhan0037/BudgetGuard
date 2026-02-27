@@ -68,4 +68,24 @@ describe("unit_calculator", function()
     assert.is_nil(detail)
     assert.is_truthy(err)
   end)
+
+  it("keeps zero units when any multiplier is zero", function()
+    local units, detail, err = unit_calculator.compute_units({
+      matched_rule = {
+        base_weight = 10,
+        plan_multiplier = 0,
+        time_multiplier = 1.0,
+        custom_multiplier = 1.0,
+      },
+      matched_source = "default",
+    }, {
+      plan_multipliers = {},
+    }, {
+      client_id = "client-1",
+    })
+
+    assert.is_nil(err)
+    assert.are.equal(0, units)
+    assert.are.equal(0, detail.raw_units)
+  end)
 end)

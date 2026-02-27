@@ -148,6 +148,35 @@ local function new_fake_redis(initial)
   }
 end
 
+-- 코루틴을 두 단계(대기 -> 실행)로 나눠 재개해 병렬 경쟁 상황을 시뮬레이션한다.
+local function run_two_phase_coroutines(worker_count, worker_fn)
+  local workers = {}
+  for index = 1, worker_count do
+    workers[index] = coroutine.create(function()
+      coroutine.yield("ready")
+      return worker_fn(index)
+    end)
+  end
+
+  -- 1단계: 모든 워커를 ready 상태로 맞춘다.
+  for index = 1, worker_count do
+    local ok, marker = coroutine.resume(workers[index])
+    assert.is_true(ok)
+    assert.are.equal("ready", marker)
+  end
+
+  local results = {}
+  -- 2단계: 동일 라운드에서 실행을 재개해 경쟁 상태를 재현한다.
+  for index = 1, worker_count do
+    local ok, value = coroutine.resume(workers[index])
+    assert.is_true(ok)
+    assert.are.equal("dead", coroutine.status(workers[index]))
+    results[index] = value
+  end
+
+  return results
+end
+
 describe("redis_store", function()
   before_each(function()
     policy_cache._reset_for_test()
@@ -345,6 +374,49 @@ describe("redis_store", function()
     assert.are.equal("300", redis.store["usage:prod:day:client:client-1:2026-02-26"])
   end)
 
+  it("keeps accurate cutoff and ttl under 1200 concurrent charge attempts", function()
+    local now_epoch = 1772107200 -- 2026-02-26 12:00:00 UTC
+    local redis = new_fake_redis({})
+    local conf = {
+      redis_env = "prod",
+      usage_grace_days = 7,
+    }
+    local budget = 350
+    local worker_count = 1200
+    local allow_count = 0
+    local deny_count = 0
+
+    local month_bucket = redis_store.compute_bucket("month", now_epoch)
+    local day_bucket = redis_store.compute_bucket("day", now_epoch)
+    local month_key = redis_store.build_usage_key("prod", "month", "client", "client-1", month_bucket)
+    local day_key = redis_store.build_usage_key("prod", "day", "client", "client-1", day_bucket)
+
+    local results = run_two_phase_coroutines(worker_count, function()
+      local result, _, err = redis_store.atomic_charge_usages(redis, conf, "client", "client-1", 1, budget, now_epoch)
+      return {
+        result = result,
+        err = err,
+      }
+    end)
+
+    for _, item in ipairs(results) do
+      assert.is_nil(item.err)
+      assert.is_table(item.result)
+      if item.result.decision == "allow" then
+        allow_count = allow_count + 1
+      else
+        deny_count = deny_count + 1
+      end
+    end
+
+    assert.are.equal(350, allow_count)
+    assert.are.equal(850, deny_count)
+    assert.are.equal("350", redis.store[month_key])
+    assert.are.equal("350", redis.store[day_key])
+    assert.is_true((redis.ttl_map[month_key] or 0) > 0)
+    assert.is_true((redis.ttl_map[day_key] or 0) > 0)
+  end)
+
   it("loads policy via cache and detects version change with probe", function()
     local now_value = 1000
     local shared = new_fake_shared_dict(function()
@@ -440,5 +512,67 @@ describe("redis_store", function()
     assert.is_table(client_high)
     assert.are.equal(20, captured_timeout)
     redis_store.close_client(client_high, false)
+  end)
+
+  it("returns auth error when redis AUTH fails", function()
+    package.loaded["resty.redis"] = {
+      new = function()
+        return {
+          set_timeout = function()
+            return
+          end,
+          connect = function()
+            return true
+          end,
+          auth = function()
+            return nil, "NOAUTH Authentication required"
+          end,
+          set_keepalive = function()
+            return true
+          end,
+        }
+      end,
+    }
+
+    local client, err, is_factory = redis_store.open_client({
+      redis_host = "127.0.0.1",
+      redis_port = 6379,
+      redis_password = "secret",
+    })
+
+    assert.is_nil(client)
+    assert.is_false(is_factory)
+    assert.is_truthy(string.find(err, "failed to auth redis", 1, true))
+  end)
+
+  it("returns select error when redis DB select fails", function()
+    package.loaded["resty.redis"] = {
+      new = function()
+        return {
+          set_timeout = function()
+            return
+          end,
+          connect = function()
+            return true
+          end,
+          select = function()
+            return nil, "NOPERM this user has no permissions"
+          end,
+          set_keepalive = function()
+            return true
+          end,
+        }
+      end,
+    }
+
+    local client, err, is_factory = redis_store.open_client({
+      redis_host = "127.0.0.1",
+      redis_port = 6379,
+      redis_database = 2,
+    })
+
+    assert.is_nil(client)
+    assert.is_false(is_factory)
+    assert.is_truthy(string.find(err, "failed to select redis db", 1, true))
   end)
 end)
